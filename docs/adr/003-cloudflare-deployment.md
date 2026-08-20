@@ -1,0 +1,3 @@
+# ADR 003 — Cloudflare Worker, Workflow, and D1
+
+Decision: a TypeScript Worker with a Cron Trigger, a Workflow, D1, and standards-based Web Push are sufficient. Do not add KV, R2, Queues, Durable Objects, Pages, Zero Trust Access, direct Workflow schedules, third-party notification services, or third-party analytics without a new requirement and review. The Cron Trigger checks operational health and starts the Workflow, the Workflow partitions I/O, D1 stores opaque state plus push endpoints, and a Worker secret protects administrative routes with HTTP Basic authentication. Web Push carries no payload and therefore discloses no banking or synchronization detail to the push service.

@@ -1,0 +1,37 @@
+{
+  "name": "fortuneo-lunchmoney-sync",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Zero-retention Fortuneo to Lunch Money synchronizer on Cloudflare Workers",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --env production --outdir dist",
+    "check": "npm run types && npm run lint && npm test && npm run build && npm run audit:security",
+    "types": "wrangler types --check && tsc --noEmit",
+    "types:generate": "wrangler types",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "audit:security": "node scripts/security-audit.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply fortuneo-lunchmoney-sync --local",
+    "db:migrate:production": "wrangler d1 migrations apply fortuneo-lunchmoney-sync --remote --env production",
+    "dev": "wrangler dev --env mock",
+    "predeploy:production": "node scripts/predeploy.mjs",
+    "deploy:production": "wrangler deploy --env production"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@eslint/js": "latest",
+    "@types/node": "latest",
+    "eslint": "latest",
+    "fast-check": "latest",
+    "globals": "latest",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

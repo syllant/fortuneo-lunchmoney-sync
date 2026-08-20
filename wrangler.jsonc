@@ -1,0 +1,125 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "fortuneo-lunchmoney-sync",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-08-13",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"workers_dev": true,
+	"preview_urls": false,
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.01
+		}
+	},
+	"vars": {
+		"ENVIRONMENT": "production",
+		"ENABLE_BANKING_BASE_URL": "https://api.enablebanking.com",
+		"LUNCH_MONEY_BASE_URL": "https://api.lunchmoney.dev/v2",
+		"BANK_NAME": "Fortuneo",
+		"BANK_COUNTRY": "FR",
+		"CALLBACK_URL": "https://replace-with-your-worker-hostname.example/callback",
+		"DATA_PROTECTION_EMAIL": "operator@example.com",
+		"WEB_PUSH_VAPID_PUBLIC_KEY": "REPLACE_WITH_YOUR_VAPID_PUBLIC_KEY",
+		"WEB_PUSH_VAPID_SUBJECT": "mailto:operator@example.com",
+		"SYNC_ENABLED": "false"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "fortuneo-lunchmoney-sync",
+			"database_id": "00000000-0000-0000-0000-000000000000",
+			"migrations_dir": "migrations"
+		}
+	],
+	"triggers": {
+		"crons": [
+			"17 4 * * *"
+		]
+	},
+	"workflows": [
+		{
+			"binding": "SYNC_WORKFLOW",
+			"name": "fortuneo-lunchmoney-sync-daily",
+			"class_name": "DailySyncWorkflow"
+		}
+	],
+	"env": {
+		"mock": {
+			"name": "fortuneo-lunchmoney-sync-mock",
+			"workers_dev": true,
+			"vars": {
+				"ENVIRONMENT": "mock",
+				"ENABLE_BANKING_BASE_URL": "https://example.invalid/enable-banking",
+				"LUNCH_MONEY_BASE_URL": "https://mock.lunchmoney.dev/v2",
+				"BANK_NAME": "Fortuneo",
+				"BANK_COUNTRY": "FR",
+				"CALLBACK_URL": "http://localhost:8787/callback",
+				"DATA_PROTECTION_EMAIL": "operator@example.com",
+				"WEB_PUSH_VAPID_PUBLIC_KEY": "REPLACE_WITH_YOUR_VAPID_PUBLIC_KEY",
+				"WEB_PUSH_VAPID_SUBJECT": "mailto:operator@example.com",
+				"SYNC_ENABLED": "false"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "fortuneo-lunchmoney-sync-mock",
+					"database_id": "00000000-0000-0000-0000-000000000001",
+					"migrations_dir": "migrations"
+				}
+			],
+			"workflows": [
+				{
+					"binding": "SYNC_WORKFLOW",
+					"name": "fortuneo-lunchmoney-sync-mock",
+					"class_name": "DailySyncWorkflow"
+				}
+			]
+		},
+		"production": {
+			"name": "fortuneo-lunchmoney-sync",
+			"workers_dev": true,
+			"preview_urls": false,
+			"vars": {
+				"ENVIRONMENT": "production",
+				"ENABLE_BANKING_BASE_URL": "https://api.enablebanking.com",
+				"LUNCH_MONEY_BASE_URL": "https://api.lunchmoney.dev/v2",
+				"BANK_NAME": "Fortuneo",
+				"BANK_COUNTRY": "FR",
+				"CALLBACK_URL": "https://replace-with-your-worker-hostname.example/callback",
+				"DATA_PROTECTION_EMAIL": "operator@example.com",
+				"WEB_PUSH_VAPID_PUBLIC_KEY": "REPLACE_WITH_YOUR_VAPID_PUBLIC_KEY",
+				"WEB_PUSH_VAPID_SUBJECT": "mailto:operator@example.com",
+				"SYNC_ENABLED": "false"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "fortuneo-lunchmoney-sync",
+					"database_id": "00000000-0000-0000-0000-000000000000",
+					"migrations_dir": "migrations"
+				}
+			],
+			"triggers": {
+				"crons": [
+					"17 4 * * *"
+				]
+			},
+			"workflows": [
+				{
+					"binding": "SYNC_WORKFLOW",
+					"name": "fortuneo-lunchmoney-sync-daily",
+					"class_name": "DailySyncWorkflow"
+				}
+			]
+		}
+	}
+}
