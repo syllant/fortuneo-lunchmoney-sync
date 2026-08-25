@@ -17,6 +17,13 @@ type ReconcileInput = Readonly<{
 
 type Prepared = Readonly<{ desired: DesiredTransaction; payloadHmac: string }>;
 
+function reconciliationRange(range: DateRange, transactions: readonly NormalizedTransaction[]): DateRange {
+  return transactions.reduce((output, transaction) => ({
+    from: transaction.date < output.from ? transaction.date : output.from,
+    to: transaction.date > output.to ? transaction.date : output.to,
+  }), range);
+}
+
 export async function reconcileTransactions(
   input: ReconcileInput,
   sink: BudgetSink,
@@ -26,7 +33,7 @@ export async function reconcileTransactions(
     touch(externalIdHmac: string, now: string): Promise<void>;
   },
 ): Promise<SyncCounts> {
-  const remote = await sink.listTransactions(input.lunchMoneyAccountId, input.range);
+  const remote = await sink.listTransactions(input.lunchMoneyAccountId, reconciliationRange(input.range, input.transactions));
   const remoteByExternalId = new Map(remote.map((transaction) => [transaction.externalId, transaction]));
   const creates: Prepared[] = [];
   const updates: (Prepared & { id: number })[] = [];
@@ -34,23 +41,32 @@ export async function reconcileTransactions(
 
   for (const transaction of input.transactions) {
     const externalId = await transactionExternalId(input.hmacKey, input.identificationHash, transaction.sourceId);
+    const alternateExternalIds = await Promise.all(transaction.alternateSourceIds.map((sourceId) =>
+      transactionExternalId(input.hmacKey, input.identificationHash, sourceId)));
+    const candidateExternalIds = [externalId, ...alternateExternalIds];
     const payloadHmac = await transactionPayloadHmac(input.hmacKey, transaction);
     const desired: DesiredTransaction = {
       externalId,
       accountId: input.lunchMoneyAccountId,
-      date: transaction.bookedDate,
+      date: transaction.date,
       amount: toLunchMoneyAmount(transaction.money, transaction.direction),
       currency: transaction.money.currency,
       payee: transaction.payee,
       notes: transaction.notes,
     };
-    const indexed = await index.find(externalId);
-    if (indexed?.payloadHmac === payloadHmac) {
+    const indexedCandidates = await Promise.all(candidateExternalIds.map((candidate) => index.find(candidate)));
+    const indexed = indexedCandidates.find((candidate) => candidate !== null) ?? null;
+    const existing = candidateExternalIds.map((candidate) => remoteByExternalId.get(candidate)).find((candidate) => candidate !== undefined);
+    const matchedIds = new Set([
+      ...indexedCandidates.filter((candidate): candidate is SyncIndexRecord => candidate !== null).map((candidate) => candidate.lunchMoneyTransactionId),
+      ...candidateExternalIds.map((candidate) => remoteByExternalId.get(candidate)?.id).filter((id): id is number => id !== undefined),
+    ]);
+    if (matchedIds.size > 1) throw new Error("TRANSACTION_IDENTITY_CONFLICT");
+    if (indexed?.externalIdHmac === externalId && indexed.payloadHmac === payloadHmac) {
       skipped += 1;
       if (!input.dryRun) await index.touch(externalId, input.now);
       continue;
     }
-    const existing = remoteByExternalId.get(externalId);
     if (indexed || existing) {
       updates.push({ desired, payloadHmac, id: indexed?.lunchMoneyTransactionId ?? existing!.id });
     } else {

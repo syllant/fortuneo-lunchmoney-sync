@@ -65,6 +65,47 @@ describe("Enable Banking contract", () => {
       identificationHash: syntheticAccount.identification_hash,
     });
   });
+
+  it("fetches detailed account metadata without exposing it through the transport layer", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ ...syntheticAccount, cash_account_type: "CACC" }));
+    const client = new EnableBankingClient("https://api.enablebanking.test", {
+      applicationId: "00000000-0000-4000-8000-000000000000",
+      privateKey: await syntheticPrivateKey(),
+    }, fetcher);
+
+    await expect(client.getAccountDetails({
+      providerAccountId: syntheticAccount.uid,
+      identificationHash: syntheticAccount.identification_hash,
+      displayHint: syntheticAccount.name,
+      currency: syntheticAccount.currency,
+    })).resolves.toMatchObject({ cashAccountType: "CACC" });
+    expect(fetcher.mock.calls[0]?.[0]).toBe("https://api.enablebanking.test/accounts/account-opaque-1/details");
+  });
+
+  it("requests booked windows and current pending sets with separate status filters", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(() =>
+      Promise.resolve(Response.json({ transactions: [], continuation_key: null })));
+    const client = new EnableBankingClient("https://api.enablebanking.test", {
+      applicationId: "00000000-0000-4000-8000-000000000000",
+      privateKey: await syntheticPrivateKey(),
+    }, fetcher);
+    const account = {
+      providerAccountId: syntheticAccount.uid,
+      identificationHash: syntheticAccount.identification_hash,
+      displayHint: syntheticAccount.name,
+      currency: syntheticAccount.currency,
+    };
+
+    await client.getTransactions(account, "BOOK", { from: "2026-08-07", to: "2026-08-13" });
+    await client.getTransactions(account, "PDNG");
+    await client.getTransactions(account);
+
+    expect(fetcher.mock.calls.map(([url]) => typeof url === "string" ? url : url instanceof URL ? url.href : url.url)).toEqual([
+      "https://api.enablebanking.test/accounts/account-opaque-1/transactions?transaction_status=BOOK&date_from=2026-08-07&date_to=2026-08-13",
+      "https://api.enablebanking.test/accounts/account-opaque-1/transactions?transaction_status=PDNG",
+      "https://api.enablebanking.test/accounts/account-opaque-1/transactions",
+    ]);
+  });
 });
 
 describe("Lunch Money v2 contract", () => {

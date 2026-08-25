@@ -5,9 +5,10 @@ export type BankAccount = Readonly<{
   identificationHash: string;
   displayHint: string;
   currency: string;
+  cashAccountType?: string;
 }>;
 
-export type Balance = Readonly<{ money: Money; status: string }>;
+export type Balance = Readonly<{ money: Money; status: string; name?: string }>;
 
 export type NormalizedAccount = Readonly<{
   identificationHash: string;

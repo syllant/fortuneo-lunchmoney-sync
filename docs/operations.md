@@ -364,7 +364,7 @@ POST https://<WORKER_HOSTNAME>/sync?dry_run=true
 
 An unauthenticated request must return `401`. With curl, use `curl -u operator -X POST "https://<WORKER_HOSTNAME>/sync?dry_run=true"`; curl prompts for the password so it does not appear in shell history. Record the returned `run_id`, inspect the Workflow instance in [Workers & Pages](https://dash.cloudflare.com/), and inspect sanitized application request logs from the Enable Banking application's context menu.
 
-Verify Fortuneo availability, `identification_hash`, stable transaction IDs, pagination, history depth, booked status, deferred debit card exposure, response sizes, and that Lunch Money remains unchanged. Stop if Fortuneo is unavailable, source IDs are unstable or missing, the identification hash is missing, pagination is incomplete, or the available data is insufficient.
+Verify Fortuneo availability, `identification_hash`, stable booked transaction IDs, immutable `entry_reference` values on `PDNG`/`HOLD` transactions, pagination for every status, history depth, deferred debit card exposure, response sizes, and that Lunch Money remains unchanged. Stop if Fortuneo is unavailable, source IDs are unstable or missing, a pending entry reference changes when it becomes booked, the identification hash is missing, pagination is incomplete, or the available data is insufficient.
 
 ## 11. Required validation order
 
@@ -447,6 +447,8 @@ Notification delivery is best effort and cannot block the daily synchronization.
 ## Inspect history when a problem is suspected
 
 Open `/notifications` for the current consent, last successful synchronization, and latest run status. For execution history, open the Cloudflare dashboard, select **Workers & Pages → fortuneo-lunchmoney-sync → Workflows → fortuneo-lunchmoney-sync-daily → Instances**. Each daily instance has a deterministic `scheduled-...` ID and shows its steps and final state. Under **Workers & Pages → fortuneo-lunchmoney-sync → Logs**, filter sanitized structured logs by `request_failed`, `scheduled_sync_started`, `notification_sent`, or `notification_failed`. Cloudflare log retention depends on the current plan, so Workflow instances are the more durable operational history. No log contains transactions, balances, descriptions, push endpoints, tokens, or account identifiers.
+
+The Workflow result also exposes aggregate `sourceDiagnostics` counters for `BOOK`, `PDNG`, and `HOLD`: received and accepted rows, plus pending rows ignored without a stable identifier or usable date. These counters contain no transaction labels, amounts, dates, or identifiers.
 
 To stop writes, restore `SYNC_ENABLED` to `"false"` and deploy immediately. Existing Workflow steps may already be running, so also inspect active instances in the Cloudflare dashboard. If code rollback is required:
 

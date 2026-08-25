@@ -18,5 +18,8 @@ export const syntheticBookedTransaction = {
 export const syntheticPendingTransaction = {
   ...syntheticBookedTransaction,
   transaction_id: "transaction-opaque-pending",
+  entry_reference: "entry-reference-opaque-pending",
   status: "PDNG",
+  transaction_date: "2026-08-11",
+  booking_date: undefined,
 };

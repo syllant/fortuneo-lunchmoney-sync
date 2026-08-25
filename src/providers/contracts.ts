@@ -10,8 +10,14 @@ export type BankSession = Readonly<{
 export interface BankSource {
   getSession(sessionId: string): Promise<BankSession>;
   listAccounts(sessionId: string): Promise<readonly BankAccount[]>;
+  getAccountDetails(account: BankAccount): Promise<BankAccount>;
   getBalances(account: BankAccount): Promise<readonly Balance[]>;
-  getBookedTransactions(account: BankAccount, range: DateRange, continuationKey?: string): Promise<TransactionPage>;
+  getTransactions(
+    account: BankAccount,
+    status?: "BOOK" | "PDNG" | "HOLD",
+    range?: DateRange,
+    continuationKey?: string,
+  ): Promise<TransactionPage>;
 }
 
 export type BudgetAccount = Readonly<{ id: number; externalId: string | null }>;

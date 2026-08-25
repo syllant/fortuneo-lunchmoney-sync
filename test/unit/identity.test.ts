@@ -4,7 +4,7 @@ import { transactionExternalId, transactionPayloadHmac } from "../../src/sync/id
 import { parseMoney } from "../../src/domain/money";
 
 const transaction = {
-  sourceId: "source-1", bookedDate: "2026-08-10", money: parseMoney("10.00", "EUR"),
+  sourceId: "source-1", alternateSourceIds: [], date: "2026-08-10", money: parseMoney("10.00", "EUR"),
   direction: "debit" as const, payee: "Synthetic", notes: null, status: "booked" as const,
 };
 

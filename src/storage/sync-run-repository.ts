@@ -12,7 +12,11 @@ export class SyncRunRepository {
   constructor(private readonly db: D1Database) {}
 
   async start(runId: string, now: string): Promise<void> {
-    await this.db.prepare("INSERT INTO sync_runs (run_id, started_at, status) VALUES (?, ?, 'running')").bind(runId, now).run();
+    await this.db.prepare(
+      "INSERT INTO sync_runs (run_id, started_at, status) VALUES (?, ?, 'running') " +
+      "ON CONFLICT(run_id) DO UPDATE SET started_at = excluded.started_at, completed_at = NULL, status = 'running', " +
+      "fetched_count = 0, created_count = 0, updated_count = 0, skipped_count = 0, error_code = NULL",
+    ).bind(runId, now).run();
   }
 
   async complete(runId: string, now: string, counts: SyncCounts, dryRun: boolean): Promise<void> {

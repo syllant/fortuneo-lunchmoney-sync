@@ -1,6 +1,6 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { formatMoney, parseMoney, toLunchMoneyAmount } from "../../src/domain/money";
+import { formatMoney, parseMoney, parseMoneyRounded, toLunchMoneyAmount } from "../../src/domain/money";
 
 describe("money", () => {
   it("preserves all EUR minor units exactly", () => {
@@ -18,5 +18,11 @@ describe("money", () => {
 
   it("rejects precision loss", () => {
     expect(() => parseMoney("1.001", "EUR")).toThrow("AMOUNT_PRECISION_LOSS");
+  });
+
+  it("rounds provisional amounts to the currency precision without using floating point", () => {
+    expect(formatMoney(parseMoneyRounded("70.959999", "EUR"))).toBe("70.96");
+    expect(formatMoney(parseMoneyRounded("26.365", "EUR"))).toBe("26.37");
+    expect(formatMoney(parseMoneyRounded("-26.365", "EUR"))).toBe("-26.37");
   });
 });

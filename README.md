@@ -1,6 +1,6 @@
 # Fortuneo → Lunch Money
 
-A personal synchronizer that reads booked Fortuneo transactions through Enable Banking and imports them into Lunch Money v2 manual accounts. It runs on Cloudflare Workers, Workflows, and D1 and is designed not to retain raw financial data in D1, logs, or Workflow results.
+A personal synchronizer that reads booked, pending, and deferred-card Fortuneo transactions through Enable Banking and imports them into Lunch Money v2 manual accounts. It runs on Cloudflare Workers, Workflows, and D1 and is designed not to retain raw financial data in D1, logs, or Workflow results.
 
 ## Important warning
 
@@ -16,7 +16,8 @@ The repository configuration is intentionally non-deployable as published and se
 
 ## What it does
 
-- reads accounts, balances, and booked transactions through Enable Banking;
+- reads accounts, balances, booked transactions, and stable pending or held card transactions through Enable Banking;
+- temporarily represents Fortuneo's labelled deferred-card balances as one synthetic pending transaction when individual card operations are absent;
 - creates or updates Lunch Money manual accounts and transactions;
 - derives opaque HMAC identifiers for idempotency;
 - stores only operational metadata in D1;
@@ -24,6 +25,10 @@ The repository configuration is intentionally non-deployable as published and se
 - optionally sends generic, empty-payload Web Push reminders.
 
 It does not initiate payments, delete Lunch Money data, or automatically verify that imported data matches a bank statement.
+
+Pending card transactions require an immutable Enable Banking `entry_reference`. Lunch Money manual-account transactions cannot carry its native pending flag, so the synchronizer imports them as unreviewed with `[Pending at Fortuneo]` in the notes and updates them when they become booked. A cancelled authorization can remain in Lunch Money and must be reconciled manually.
+
+Fortuneo's AIS feed currently returns current-month and next-month deferred-card balance summaries without their individual operations. The synchronizer aggregates those labelled summaries into a single `Fortuneo deferred cards` transaction with a stable identity. This is an approximate workaround: it provides the outstanding total, not merchant-level detail, and the transaction is updated to zero after the deferred balance clears.
 
 ## Before deployment
 

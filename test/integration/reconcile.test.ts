@@ -39,7 +39,7 @@ class MemorySink implements BudgetSink {
 }
 
 const baseTransaction = {
-  sourceId: "source-1", bookedDate: "2026-08-10", money: parseMoney("12.34", "EUR"),
+  sourceId: "source-1", alternateSourceIds: [], date: "2026-08-10", money: parseMoney("12.34", "EUR"),
   direction: "debit" as const, payee: "Synthetic", notes: null, status: "booked" as const,
 };
 const range = { from: "2026-08-07", to: "2026-08-13" };
@@ -62,6 +62,35 @@ describe("reconciliation", () => {
     const result = await reconcileTransactions({ ...input, transactions: [{ ...baseTransaction, money: parseMoney("12.35", "EUR") }] }, sink, index);
     expect(result.updated).toBe(1);
     expect(sink.transactions[0]?.amount).toBe("12.35");
+  });
+
+  it("turns a stable pending transaction into booked without creating a duplicate", async () => {
+    const sink = new MemorySink();
+    const index = new MemoryIndex();
+    const pending = {
+      ...baseTransaction,
+      date: "2026-08-09",
+      notes: "[Pending at Fortuneo]",
+      status: "pending" as const,
+    };
+    const input = { transactions: [pending], identificationHash: "account-hash", lunchMoneyAccountId: 1, range, hmacKey: "secret", dryRun: false, now: "2026-08-13T00:00:00Z" };
+    await reconcileTransactions(input, sink, index);
+    const result = await reconcileTransactions({ ...input, transactions: [baseTransaction] }, sink, index);
+    expect(result).toMatchObject({ created: 0, updated: 1 });
+    expect(sink.transactions).toHaveLength(1);
+    expect(sink.transactions[0]).toMatchObject({ date: "2026-08-10", notes: null });
+  });
+
+  it("migrates an existing transaction-id identity to its stable entry-reference identity", async () => {
+    const sink = new MemorySink();
+    const legacyIndex = new MemoryIndex();
+    const legacy = { ...baseTransaction, sourceId: "legacy-transaction-id" };
+    const baseInput = { identificationHash: "account-hash", lunchMoneyAccountId: 1, range, hmacKey: "secret", dryRun: false, now: "2026-08-13T00:00:00Z" };
+    await reconcileTransactions({ ...baseInput, transactions: [legacy] }, sink, legacyIndex);
+    const stable = { ...baseTransaction, sourceId: "stable-entry-reference", alternateSourceIds: ["legacy-transaction-id"] };
+    const result = await reconcileTransactions({ ...baseInput, transactions: [stable] }, sink, legacyIndex);
+    expect(result).toMatchObject({ created: 0, updated: 1 });
+    expect(sink.transactions).toHaveLength(1);
   });
 
   it("repairs D1 index after a remote-only partial write", async () => {

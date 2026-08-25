@@ -84,14 +84,29 @@ export class EnableBankingClient implements BankSource {
     return (await this.getSession(sessionId)).accounts;
   }
 
+  async getAccountDetails(account: BankAccount): Promise<BankAccount> {
+    return mapAccount(await this.request(`/accounts/${encodeURIComponent(account.providerAccountId)}/details`));
+  }
+
   async getBalances(account: BankAccount): Promise<readonly Balance[]> {
     return mapBalances(await this.request(`/accounts/${encodeURIComponent(account.providerAccountId)}/balances`));
   }
 
-  async getBookedTransactions(account: BankAccount, range: DateRange, continuationKey?: string): Promise<TransactionPage> {
-    const query = new URLSearchParams({ date_from: range.from, date_to: range.to, transaction_status: "BOOK" });
+  async getTransactions(
+    account: BankAccount,
+    status?: "BOOK" | "PDNG" | "HOLD",
+    range?: DateRange,
+    continuationKey?: string,
+  ): Promise<TransactionPage> {
+    const query = new URLSearchParams();
+    if (status) query.set("transaction_status", status);
+    if (range) {
+      query.set("date_from", range.from);
+      query.set("date_to", range.to);
+    }
     if (continuationKey) query.set("continuation_key", continuationKey);
-    return mapTransactionPage(await this.request(`/accounts/${encodeURIComponent(account.providerAccountId)}/transactions?${query}`));
+    const suffix = query.size > 0 ? `?${query}` : "";
+    return mapTransactionPage(await this.request(`/accounts/${encodeURIComponent(account.providerAccountId)}/transactions${suffix}`));
   }
 
   private mapSession(payload: JsonObject, fallbackSessionId?: string): BankSession {

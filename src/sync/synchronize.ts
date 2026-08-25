@@ -1,6 +1,6 @@
 import type { BankAccount, NormalizedAccount } from "../domain/account";
 import { DomainError, errorCode } from "../domain/errors";
-import type { DateRange, NormalizedTransaction } from "../domain/transaction";
+import type { DateRange, NormalizedTransaction, TransactionPageDiagnostics } from "../domain/transaction";
 import type { BankSource, BudgetSink } from "../providers/contracts";
 import { accountExternalId } from "./identity";
 import { AccountRepository } from "../storage/account-repository";
@@ -9,15 +9,70 @@ import { SyncIndexRepository } from "../storage/sync-index-repository";
 import { SyncLockRepository } from "../storage/sync-lock-repository";
 import { SyncRunRepository, type SyncCounts } from "../storage/sync-run-repository";
 import { reconcileTransactions } from "./reconcile";
+import { deferredBalanceTransaction } from "./deferred-balance";
 
 export type SynchronizeOptions = Readonly<{ dryRun: boolean; range: DateRange; runId?: string }>;
 
-function add(left: SyncCounts, right: SyncCounts): SyncCounts {
-  return { fetched: left.fetched + right.fetched, created: left.created + right.created, updated: left.updated + right.updated, skipped: left.skipped + right.skipped };
+type TransactionStatus = "BOOK" | "PDNG" | "HOLD";
+export type SourceDiagnostics = Readonly<Record<TransactionStatus, TransactionPageDiagnostics>>;
+export type SynchronizeResult = SyncCounts & Readonly<{ sourceDiagnostics: SourceDiagnostics }>;
+
+const ZERO_DIAGNOSTICS: TransactionPageDiagnostics = {
+  received: 0,
+  accepted: 0,
+  ignoredWithoutStableId: 0,
+  ignoredWithoutDate: 0,
+};
+
+function addDiagnostics(left: TransactionPageDiagnostics, right: TransactionPageDiagnostics): TransactionPageDiagnostics {
+  return {
+    received: left.received + right.received,
+    accepted: left.accepted + right.accepted,
+    ignoredWithoutStableId: left.ignoredWithoutStableId + right.ignoredWithoutStableId,
+    ignoredWithoutDate: left.ignoredWithoutDate + right.ignoredWithoutDate,
+  };
+}
+
+function emptyResult(): SynchronizeResult {
+  return {
+    fetched: 0,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    sourceDiagnostics: { BOOK: ZERO_DIAGNOSTICS, PDNG: ZERO_DIAGNOSTICS, HOLD: ZERO_DIAGNOSTICS },
+  };
+}
+
+function add(left: SynchronizeResult, right: SynchronizeResult): SynchronizeResult {
+  return {
+    fetched: left.fetched + right.fetched,
+    created: left.created + right.created,
+    updated: left.updated + right.updated,
+    skipped: left.skipped + right.skipped,
+    sourceDiagnostics: {
+      BOOK: addDiagnostics(left.sourceDiagnostics.BOOK, right.sourceDiagnostics.BOOK),
+      PDNG: addDiagnostics(left.sourceDiagnostics.PDNG, right.sourceDiagnostics.PDNG),
+      HOLD: addDiagnostics(left.sourceDiagnostics.HOLD, right.sourceDiagnostics.HOLD),
+    },
+  };
 }
 
 function chooseBalance(balances: Awaited<ReturnType<BankSource["getBalances"]>>) {
   return balances.find((balance) => balance.status === "CLAV") ?? balances[0];
+}
+
+function preferTransaction(left: NormalizedTransaction, right: NormalizedTransaction): NormalizedTransaction {
+  if (left.status === right.status) return left;
+  return left.status === "booked" ? left : right;
+}
+
+function mergeTransactions(transactions: readonly NormalizedTransaction[]): readonly NormalizedTransaction[] {
+  const bySourceId = new Map<string, NormalizedTransaction>();
+  for (const transaction of transactions) {
+    const current = bySourceId.get(transaction.sourceId);
+    bySourceId.set(transaction.sourceId, current ? preferTransaction(current, transaction) : transaction);
+  }
+  return [...bySourceId.values()];
 }
 
 export class Synchronizer {
@@ -40,7 +95,7 @@ export class Synchronizer {
     this.locks = new SyncLockRepository(db);
   }
 
-  async synchronize(options: SynchronizeOptions): Promise<SyncCounts> {
+  async synchronize(options: SynchronizeOptions): Promise<SynchronizeResult> {
     const runId = options.runId ?? crypto.randomUUID();
     const started = new Date();
     if (!(await this.locks.acquire(runId, started))) throw new DomainError("SYNC_ALREADY_RUNNING");
@@ -59,7 +114,7 @@ export class Synchronizer {
 
     try {
       const bankAccounts = await this.source.listAccounts(connection.sessionId);
-      let total: SyncCounts = { fetched: 0, created: 0, updated: 0, skipped: 0 };
+      let total = emptyResult();
       for (const bankAccount of bankAccounts) {
         total = add(total, await this.synchronizeAccount(connection.id, bankAccount, options));
       }
@@ -77,7 +132,7 @@ export class Synchronizer {
     }
   }
 
-  private async synchronizeAccount(connectionId: string, bankAccount: BankAccount, options: SynchronizeOptions): Promise<SyncCounts> {
+  private async synchronizeAccount(connectionId: string, bankAccount: BankAccount, options: SynchronizeOptions): Promise<SynchronizeResult> {
     const now = new Date().toISOString();
     const stored = await this.accounts.upsert(connectionId, bankAccount, now);
     const balances = await this.source.getBalances(bankAccount);
@@ -97,9 +152,11 @@ export class Synchronizer {
       await this.accounts.linkLunchMoney(stored.id, account.id, now);
     }
 
-    const transactions = await this.fetchAll(bankAccount, options.range);
+    const fetched = await this.fetchAll(bankAccount, options.range);
+    const virtualDeferredBalance = deferredBalanceTransaction(balances, bankAccount.currency, now.slice(0, 10));
+    const transactions = virtualDeferredBalance ? [...fetched.transactions, virtualDeferredBalance] : fetched.transactions;
     if (!lunchMoneyAccountId) {
-      return { fetched: transactions.length, created: transactions.length, updated: 0, skipped: 0 };
+      return { fetched: transactions.length, created: transactions.length, updated: 0, skipped: 0, sourceDiagnostics: fetched.sourceDiagnostics };
     }
     const counts = await reconcileTransactions({
       transactions,
@@ -111,16 +168,42 @@ export class Synchronizer {
       now,
     }, this.sink, this.index);
     if (!options.dryRun) await this.sink.updateBalance(lunchMoneyAccountId, balance.money);
-    return counts;
+    return { ...counts, sourceDiagnostics: fetched.sourceDiagnostics };
   }
 
-  private async fetchAll(account: BankAccount, range: DateRange): Promise<readonly NormalizedTransaction[]> {
+  private async fetchAll(account: BankAccount, range: DateRange): Promise<Readonly<{
+    transactions: readonly NormalizedTransaction[];
+    sourceDiagnostics: SourceDiagnostics;
+  }>> {
+    const pages = await Promise.all([
+      this.fetchAllForStatus(account, "BOOK", range),
+      this.fetchAllForStatus(account, "PDNG"),
+      this.fetchAllForStatus(account, "HOLD"),
+    ]);
+    return {
+      transactions: mergeTransactions(pages.flatMap((page) => page.transactions)),
+      sourceDiagnostics: { BOOK: pages[0].diagnostics, PDNG: pages[1].diagnostics, HOLD: pages[2].diagnostics },
+    };
+  }
+
+  private async fetchAllForStatus(
+    account: BankAccount,
+    status: "BOOK" | "PDNG" | "HOLD",
+    range?: DateRange,
+  ): Promise<Readonly<{ transactions: readonly NormalizedTransaction[]; diagnostics: TransactionPageDiagnostics }>> {
     const output: NormalizedTransaction[] = [];
+    let diagnostics = ZERO_DIAGNOSTICS;
     let continuation: string | undefined;
     for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
-      const page = await this.source.getBookedTransactions(account, range, continuation);
+      const page = await this.source.getTransactions(account, status, range, continuation);
       output.push(...page.transactions);
-      if (!page.continuationKey) return output;
+      diagnostics = addDiagnostics(diagnostics, page.diagnostics ?? {
+        received: page.transactions.length,
+        accepted: page.transactions.length,
+        ignoredWithoutStableId: 0,
+        ignoredWithoutDate: 0,
+      });
+      if (!page.continuationKey) return { transactions: output, diagnostics };
       continuation = page.continuationKey;
     }
     throw new DomainError("ENABLE_BANKING_PAGINATION_LIMIT");

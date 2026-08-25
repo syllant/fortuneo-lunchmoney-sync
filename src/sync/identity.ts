@@ -16,7 +16,7 @@ export async function transactionPayloadHmac(secret: string, transaction: Normal
     minor_digits: transaction.money.minorDigits,
     currency: transaction.money.currency,
     direction: transaction.direction,
-    booked_date: transaction.bookedDate,
+    date: transaction.date,
     payee: transaction.payee,
     notes: transaction.notes,
     status: transaction.status,

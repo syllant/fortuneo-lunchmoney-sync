@@ -10,7 +10,7 @@ const PRIVACY = `
 <h2>Controller and contact</h2>
 <p>The application operator is the data controller. Data-protection questions and requests may be sent to __CONTACT_EMAIL__.</p>
 <h2>Data processed and purpose</h2>
-<p>After the operator gives explicit bank authorization, the application processes account identifiers, account balances, and booked transaction details supplied through Enable Banking. It uses this information only to create or update corresponding manual accounts and transactions in Lunch Money.</p>
+<p>After the operator gives explicit bank authorization, the application processes account identifiers, account balances, and booked, pending, or held transaction details supplied through Enable Banking. It uses this information only to create or update corresponding manual accounts and transactions in Lunch Money.</p>
 <h2>Storage and retention</h2>
 <p>Raw banking responses, transaction descriptions, amounts, and balances are processed transiently and are not stored in the application's Cloudflare D1 database. D1 stores only operational metadata such as opaque provider session references, account identification hashes, HMAC fingerprints, timestamps, counters, and synchronization state. OAuth state is valid for five minutes and can be consumed only once. Imported financial records remain in Lunch Money until the operator changes or deletes them there.</p>
 <h2>Processors and recipients</h2>

@@ -11,7 +11,7 @@ export type Money = Readonly<{
   minorDigits: number;
 }>;
 
-export function parseMoney(value: string, currencyInput: string): Money {
+function parseMoneyValue(value: string, currencyInput: string, roundDiscarded: boolean): Money {
   const currency = currencyInput.toUpperCase();
   if (!/^[A-Z]{3}$/.test(currency)) throw new DomainError("INVALID_CURRENCY");
   const minorDigits = MINOR_DIGITS[currency] ?? 2;
@@ -20,11 +20,21 @@ export function parseMoney(value: string, currencyInput: string): Money {
   const sign = match[1] === "-" ? -1n : 1n;
   const whole = match[2] ?? "0";
   const fraction = match[3] ?? "";
-  if (fraction.length > minorDigits && /[1-9]/.test(fraction.slice(minorDigits))) {
+  const discarded = fraction.slice(minorDigits);
+  if (!roundDiscarded && /[1-9]/.test(discarded)) {
     throw new DomainError("AMOUNT_PRECISION_LOSS");
   }
   const padded = fraction.padEnd(minorDigits, "0").slice(0, minorDigits);
-  return { minor: sign * BigInt(`${whole}${padded}`), currency, minorDigits };
+  const rounded = roundDiscarded && (discarded[0] ?? "0") >= "5" ? 1n : 0n;
+  return { minor: sign * (BigInt(`${whole}${padded}`) + rounded), currency, minorDigits };
+}
+
+export function parseMoney(value: string, currencyInput: string): Money {
+  return parseMoneyValue(value, currencyInput, false);
+}
+
+export function parseMoneyRounded(value: string, currencyInput: string): Money {
+  return parseMoneyValue(value, currencyInput, true);
 }
 
 export function formatMoney(money: Money): string {
