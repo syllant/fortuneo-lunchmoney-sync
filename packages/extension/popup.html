@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fortuneo sync</title><link rel="stylesheet" href="popup.css"></head>
+  <body>
+    <main>
+      <header><h1>Fortuneo sync</h1></header>
+      <p id="message" class="message"></p>
+      <section class="daily-card">
+        <div><strong id="daily-title">Not synced today</strong><span id="daily-detail">Checking for today’s sync…</span></div>
+        <button id="daily-sync" class="secondary">Sync now</button>
+      </section>
+      <button id="dry-run" class="secondary">Preview sync</button>
+      <div class="auth-actions"><button id="reconnect" class="secondary" hidden>Sign in to Fortuneo</button></div>
+      <nav class="tabs" role="tablist" aria-label="Fortuneo sync sections">
+        <button class="tab active" role="tab" aria-selected="true" data-tab="sync">Sync</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="accounts">Accounts</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="setup">Setup</button>
+      </nav>
+      <section id="tab-sync" class="tab-panel" role="tabpanel">
+        <section id="preview" class="preview" hidden>
+          <div class="preview-heading"><h2 id="preview-title">Proposed changes</h2><span id="preview-count"></span></div>
+          <div id="preview-progress" class="preview-progress" hidden><div class="progress-main"><ol id="progress-steps" class="progress-steps"></ol><div class="progress-track" aria-label="Sync progress"><span id="progress-bar"></span></div></div><button id="stop" class="danger">Stop</button></div>
+          <div id="preview-results" hidden>
+            <details id="transaction-details" class="result-details" open><summary>Transactions <span id="transaction-count"></span></summary><div class="table-wrap"><table><thead><tr><th>Action</th><th>Issue</th><th>Status</th><th>Date</th><th>Merchant</th><th>Category</th><th class="amount">Amount</th><th>Lunch Money account</th></tr></thead><tbody id="transaction-preview"></tbody></table></div></details>
+            <p id="preview-truncated" class="hint"></p>
+            <div id="sync-suggestion" class="sync-suggestion" hidden><span>Everything looks right?</span><button id="sync">Confirm sync</button></div>
+          </div>
+        </section>
+      </section>
+      <section id="tab-accounts" class="tab-panel" role="tabpanel" hidden>
+        <div class="panel-heading"><h2>Account mappings</h2><span id="account-count"></span></div>
+        <p id="accounts-empty" class="empty-state">Run a sync to inspect Fortuneo-to-Lunch Money account mappings.</p>
+        <details id="account-details" class="result-details" open hidden><summary>Mappings <span id="account-summary-count"></span></summary><div class="table-wrap account-table-wrap"><table><thead><tr><th>Fortuneo account</th><th>Mapping</th><th>Lunch Money account</th><th class="amount">Balance</th></tr></thead><tbody id="account-preview"></tbody></table></div></details>
+      </section>
+      <section id="tab-setup" class="tab-panel setup" role="tabpanel" hidden>
+        <h2>Secure setup</h2>
+        <label>Fortuneo identifier<input id="fortuneo-access-code" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Stored only in macOS Keychain"></label>
+        <label>Fortuneo password<input id="fortuneo-password" type="password" autocomplete="off" spellcheck="false" placeholder="Stored only in macOS Keychain"></label>
+        <label>Lunch Money API token<input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Stored only in macOS Keychain"></label>
+        <button id="load-accounts" class="secondary full">Load accounts</button>
+        <label>Existing checking account<select id="account"><option value="">Load accounts first</option></select></label>
+        <button id="configure" class="full">Save secure setup</button>
+        <p class="hint">Credentials and the Lunch Money token are stored only in macOS Keychain. Fortuneo sign-in is attempted once automatically; security challenges still require your confirmation.</p>
+      </section>
+      <ul id="warnings"></ul>
+      <details id="auth-debug" class="auth-debug" hidden>
+        <summary>Authentication diagnostics</summary>
+        <pre id="auth-debug-log"></pre>
+        <button id="copy-debug" class="secondary">Copy diagnostics</button>
+      </details>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+{
+  "name": "fortuneo-lunchmoney-sync",
+  "version": "2.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Local-first Fortuneo to Lunch Money synchronizer for Chrome and macOS",
+  "scripts": {
+    "build": "npm run clean && tsc -p tsconfig.build.json && node scripts/build-extension.mjs",
+    "check": "npm run typecheck && npm run lint && npm test && npm run build && npm run audit:security",
+    "clean": "node scripts/clean.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint packages scripts test",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "audit:security": "node scripts/security-audit.mjs",
+    "install:local": "bash scripts/install-macos.sh",
+    "uninstall:local": "bash scripts/uninstall-macos.sh"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@lunch-money/lunch-money-js-v2": "2.11.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "latest",
+    "@types/chrome": "latest",
+    "@types/node": "latest",
+    "eslint": "latest",
+    "fast-check": "latest",
+    "globals": "latest",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "vitest": "4.1.11"
+  }
+}

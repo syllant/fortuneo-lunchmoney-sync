@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Fortuneo → Lunch Money",
+  "version": "2.1.51",
+  "description": "Runs a local Fortuneo sync when Lunch Money is opened or its Overview page is visited.",
+  "minimum_chrome_version": "120",
+  "permissions": ["storage", "nativeMessaging", "tabs", "scripting", "alarms"],
+  "host_permissions": [
+    "https://my.lunchmoney.app/*",
+    "https://beta.lunchmoney.app/*",
+    "https://mabanque.fortuneo.fr/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Fortuneo → Lunch Money",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://my.lunchmoney.app/*", "https://beta.lunchmoney.app/*"],
+      "js": ["lunch-money-content.js"],
+      "css": ["banner.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://mabanque.fortuneo.fr/*"],
+      "js": ["fortuneo-content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}
