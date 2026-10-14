@@ -51,6 +51,7 @@ export interface SafeErrorDiagnostic {
   code: string;
   phase?: string;
   kind: string;
+  hint?: string;
   location?: string;
   fingerprint: string;
 }

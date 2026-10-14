@@ -2,7 +2,7 @@
 import { parseNativeRequest, type NativeResponse, type ResultSummary } from "../../shared/src/messages.js";
 import { readNativeMessages, writeNativeMessage } from "./framing.js";
 import { KeychainStore } from "./keychain.js";
-import { safeErrorDiagnostic } from "./redaction.js";
+import { safeErrorDiagnostic, SyncPhaseError } from "./redaction.js";
 import { SyncService } from "./sync-service.js";
 
 const send = (message: NativeResponse): void => writeNativeMessage(process.stdout, message);
@@ -36,12 +36,14 @@ function errorSummary(error: unknown): ResultSummary {
 try {
   for await (const raw of readNativeMessages(process.stdin)) {
     let requestId = "invalid";
+    let phase = "validating-request";
     try {
       const request = parseNativeRequest(raw);
       requestId = request.requestId;
+      phase = request.type;
       await service.handle(request);
     } catch (error) {
-      send({ version: 2, type: "result", requestId, ok: false, dryRun: false, summary: errorSummary(error) });
+      send({ version: 2, type: "result", requestId, ok: false, dryRun: false, summary: errorSummary(error instanceof SyncPhaseError ? error : new SyncPhaseError(phase, error)) });
     }
   }
 } catch (error) {

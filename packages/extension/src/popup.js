@@ -87,11 +87,14 @@ function render(state, storageState = appState) {
   renderDailyStatus(state, storageState);
   elements.reconnect.hidden = !fortuneoSignInRequired(state);
   elements.warnings.replaceChildren(...(state.warnings ?? []).map((warning) => Object.assign(document.createElement("li"), { textContent: warning })));
-  renderDebugTrace(state.authTrace);
+  renderDebugTrace(state.authTrace, state);
   renderPreview(state);
 }
 
-function renderDebugTrace(trace) {
+function renderDebugTrace(trace, state) {
+  if ((!Array.isArray(trace) || trace.length === 0) && ["review", "error"].includes(state?.status)) {
+    trace = [{ at: 0, event: "failure-context-unavailable", version: chrome.runtime.getManifest().version, status: state.status, message: state.message, updatedAt: state.updatedAt }];
+  }
   const visible = Array.isArray(trace) && trace.length > 0;
   elements["auth-debug"].hidden = !visible;
   elements["auth-debug-log"].textContent = visible ? trace.map(formatTraceEntry).join("\n") : "";

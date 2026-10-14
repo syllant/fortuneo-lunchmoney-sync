@@ -3,7 +3,7 @@ import { adaptFortuneo } from "./fortuneo-adapter.js";
 const NATIVE_HOST = "com.sylvaindurand.fortuneo_lunchmoney_sync";
 const FORTUNEO_LOGIN = "https://mabanque.fortuneo.fr/mon-espace";
 const FORTUNEO_TAB_URL = "https://mabanque.fortuneo.fr/*";
-const FORTUNEO_COLLECTOR_VERSION = 15;
+const FORTUNEO_COLLECTOR_VERSION = 16;
 const FORTUNEO_COLLECT_MESSAGE = `collect-snapshot-v${FORTUNEO_COLLECTOR_VERSION}`;
 const LUNCH_MONEY_URLS = ["https://my.lunchmoney.app/*", "https://beta.lunchmoney.app/*"];
 const DAILY_STATUS_ALARM = "refresh-daily-status";
@@ -204,8 +204,7 @@ async function startSync(type, confirmedSnapshot = null) {
       startupStage = "checking-credentials";
       const credentials = await nativeOneShot({ version: 2, type: "get-fortuneo-credentials", requestId: crypto.randomUUID() }, "fortuneo-credentials");
       if (credentials?.type !== "fortuneo-credentials") {
-        const code = credentials?.error ?? "NATIVE_HOST_UNAVAILABLE";
-        await setUi("error", code, [code], null, type === "dry-run" ? "preview" : "sync");
+        await reportNativeStartupFailure(type, startupStage, credentials);
         return false;
       }
       if (!credentials.available) {
@@ -218,6 +217,10 @@ async function startSync(type, confirmedSnapshot = null) {
       nativeOneShot({ version: 2, type: "get-fortuneo-account-urls", requestId: crypto.randomUUID() }, "fortuneo-account-urls"),
       chrome.tabs.query({ active: true, lastFocusedWindow: true }),
     ]);
+    if (knownAccountsResponse?.type !== "fortuneo-account-urls") {
+      await reportNativeStartupFailure(type, startupStage, knownAccountsResponse);
+      return false;
+    }
     const requestedFortuneoUrl = canonicalFortuneoAccountUrl(focusedTab?.url);
     const requestedFortuneoTabId = requestedFortuneoUrl && focusedTab?.id !== undefined ? focusedTab.id : null;
     const knownFortuneoAccountUrls = knownAccountsResponse?.type === "fortuneo-account-urls" ? knownAccountsResponse.urls : [];
@@ -286,9 +289,18 @@ async function reportStartupFailure(type, stage, error) {
   const code = chromeErrorCode(error);
   const kind = internalErrorKind(error);
   const location = internalErrorLocation(error);
-  const trace = [{ at: 0, event: "startup-error", stage, result: code, kind, location }];
+  const hint = internalErrorHint(error);
+  const trace = [{ at: 0, event: "startup-error", stage, result: code, kind, location, hint }];
   const phase = startupStageLabel(stage);
-  await setUi("error", `Sync could not start during ${phase}: ${code} (${kind} at ${location}).`, [code], null, type === "dry-run" ? "preview" : "sync", trace);
+  await setUi("error", `Sync could not start during ${phase}: ${hint} (${code}; ${kind} at ${location}). Copy diagnostics to report it.`, [code], null, type === "dry-run" ? "preview" : "sync", trace);
+}
+
+async function reportNativeStartupFailure(type, stage, response) {
+  const summary = response?.summary ?? { message: response?.error ?? "NATIVE_HOST_UNAVAILABLE" };
+  const code = summary.diagnostic?.code ?? summary.message;
+  const phase = startupStageLabel(stage);
+  const trace = [{ at: 0, event: "startup-error", stage, result: code, ...summary.diagnostic }];
+  await setUi("error", syncFailureLabel(summary, phase), [code], null, type === "dry-run" ? "preview" : "sync", trace);
 }
 
 function startupStageLabel(stage) {
@@ -328,6 +340,7 @@ async function handleNativeMessage(message) {
       await collectAndForwardSnapshot(message.requestId);
     }
   } else if (message.type === "progress") {
+    activeSync.nativePhase = message.phase;
     activeSync.progressStep = progressStepForPhase(message.phase);
     await setUi("running", phaseLabel(message.phase), []);
   } else if (message.type === "details") {
@@ -350,6 +363,7 @@ async function handleNativeMessage(message) {
     // not turn an already completed sync back into an error (or leave the UI
     // on its last running state while both handlers race).
     const completed = activeSync;
+    if (!message.ok && !message.summary?.details) traceAuth(completed, "native-error", { ...message.summary?.diagnostic });
     clearFortuneoWait(completed);
     activeSync = null;
     const deferredDetailFailures = Number(completed.fortuneoDiagnostics?.deferredDetailFailures ?? 0);
@@ -366,14 +380,14 @@ async function handleNativeMessage(message) {
       ? ` ${deferredDetailFailures} deferred transaction detail${deferredDetailFailures === 1 ? "" : "s"} will be retried automatically during the next daily sync.`
       : "";
     const resultMessage = !message.ok && !details
-      ? syncFailureLabel(message.summary)
+      ? syncFailureLabel(message.summary, syncStageLabel(completed))
       : message.dryRun
         ? (details ? (completedWithWarnings ? `Preview ready with ${warningCount} warning${warningCount === 1 ? "" : "s"}.` : `Review the changes below.${automaticRetryNote}`) : summaryLabel(message.summary, true, completed.fortuneoDiagnostics))
         : (completedWithWarnings ? `Sync complete with ${warningCount} warning${warningCount === 1 ? "" : "s"}.` : completedOk ? `${syncCompletionLabel(details)}${automaticRetryNote}` : syncFailureLabel(message.summary));
     if (message.dryRun && Boolean(details) && completed.snapshot) await chrome.storage.session.set({ confirmedPreviewSnapshot: completed.snapshot });
     else if (!message.dryRun || !message.ok) await chrome.storage.session.remove("confirmedPreviewSnapshot");
     if (Boolean(details) && !message.dryRun) await chrome.storage.local.set({ ...(reviewNotification.keys ? { reportedCardReviewKeys: reviewNotification.keys } : {}), lastSuccessfulLocalDate: localDate(), lastSuccessfulAt: new Date().toISOString(), setupPreviewConfirmed: true });
-    await setUi(status, resultMessage, warnings, details, message.dryRun ? "preview" : "sync");
+    await setUi(status, resultMessage, warnings, details, message.dryRun ? "preview" : "sync", completed.authTrace);
     const port = completed.port;
     port.disconnect();
     await stopFortuneoCapture(completed, true);
@@ -381,6 +395,14 @@ async function handleNativeMessage(message) {
 }
 
 async function collectAndForwardSnapshot(requestId) {
+  try {
+    await readAndForwardSnapshot(requestId);
+  } catch (error) {
+    await failActiveSync(requestId, error);
+  }
+}
+
+async function readAndForwardSnapshot(requestId) {
   if (!activeSync || activeSync.requestId !== requestId) return;
   if (activeSync.collecting) return;
   activeSync.collecting = true;
@@ -453,6 +475,7 @@ async function collectAndForwardSnapshot(requestId) {
   try {
     response = await sendFortuneoMessage(tab.id, { type: FORTUNEO_COLLECT_MESSAGE });
   } catch (error) {
+    if (chromeErrorCode(error) === "UNEXPECTED_ERROR") throw error;
     response = { ok: false, error: chromeErrorCode(error) };
   }
   traceAuth(activeSync, "collection-response", { ok: Boolean(response?.ok), payloads: Array.isArray(response?.payloads) ? response.payloads.length : 0, result: response?.error ?? "ok" });
@@ -498,7 +521,8 @@ async function collectAndForwardSnapshot(requestId) {
     activeSync = null;
     port.disconnect();
     await stopFortuneoCapture(failed, true);
-    await setUi("review", code === "NO_FORTUNEO_DATA_CAPTURED" ? "Open the Fortuneo accounts page, then retry the sync" : code, [code], null, failed.dryRun ? "preview" : "sync");
+    traceAuth(failed, "collection-error", { result: code, ...response?.diagnostic });
+    await setUi("review", syncFailureLabel({ message: code, diagnostic: response?.diagnostic }, "the Fortuneo data read"), [code], null, failed.dryRun ? "preview" : "sync", failed.authTrace);
     return;
   }
   activeSync.stage = "preparing-snapshot";
@@ -949,10 +973,25 @@ async function failActiveSync(requestId, error) {
   activeSync = null;
   clearFortuneoWait(failed);
   failed.port.disconnect();
-  await stopFortuneoCapture(failed, true);
   const code = chromeErrorCode(error);
-  traceAuth(failed, "sync-error", { result: code, stage: failed.stage ?? "unknown", kind: internalErrorKind(error), location: internalErrorLocation(error) });
-  await setUi("error", code, [code], null, failed.dryRun ? "preview" : "sync", failed.authTrace);
+  const kind = internalErrorKind(error);
+  const location = internalErrorLocation(error);
+  const hint = internalErrorHint(error);
+  const phase = syncStageLabel(failed);
+  traceAuth(failed, "sync-error", { result: code, stage: failed.stage ?? failed.progressStep ?? "setup", kind, location, hint });
+  try {
+    await stopFortuneoCapture(failed, true);
+  } catch (cleanupError) {
+    traceAuth(failed, "cleanup-error", { kind: internalErrorKind(cleanupError), location: internalErrorLocation(cleanupError) });
+  }
+  await setUi("error", `Sync failed during ${phase}: ${hint} (${code}; ${kind} at ${location}). Copy diagnostics to report it.`, [code], null, failed.dryRun ? "preview" : "sync", failed.authTrace);
+}
+
+function syncStageLabel(sync) {
+  if (sync.nativePhase) return diagnosticPhaseLabel(sync.nativePhase);
+  return ({ "collecting-fortuneo": "the Fortuneo data read", "preparing-snapshot": "Fortuneo data processing", "native-handoff": "native helper processing" })[sync.stage]
+    ?? ({ setup: "local setup", connection: "the Fortuneo connection", fortuneo: "the Fortuneo data read", prepare: "sync preparation", write: "Lunch Money writes" })[sync.progressStep]
+    ?? "sync initialization";
 }
 
 async function cancelSync() {
@@ -992,7 +1031,22 @@ function internalErrorKind(error) {
   if (/JSON|Unexpected token|parse/i.test(message)) return "invalid-json";
   if (/No tab|tab.*closed|frame.*removed/i.test(message)) return "tab-lifecycle";
   if (/port|disconnected/i.test(message)) return "native-port";
-  return error instanceof Error ? error.name : "unknown";
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof SyntaxError) return "SyntaxError";
+  if (error instanceof RangeError) return "RangeError";
+  return error instanceof Error ? "Error" : "NonErrorThrow";
+}
+
+function internalErrorHint(error) {
+  return ({
+    "state-race": "The sync state changed while an operation was still running",
+    "invalid-json": "A response could not be read as valid JSON",
+    "tab-lifecycle": "The Fortuneo tab closed or changed while it was being read",
+    "native-port": "The connection to the native helper was interrupted",
+    TypeError: "The sync encountered an unexpected data type",
+    SyntaxError: "A response could not be parsed",
+    RangeError: "A value exceeded the supported range",
+  })[internalErrorKind(error)] ?? "An internal operation failed; the exact cause is not yet known";
 }
 
 function internalErrorLocation(error) {
@@ -1030,7 +1084,7 @@ async function setUi(status, message, warnings, details = null, resultOperation 
   }
   const operation = resultOperation ?? ((status === "running" || status === "needs-auth") && activeSync ? (activeSync.dryRun ? "preview" : "sync") : null);
   const retainedDetails = details ?? ((status === "running" || status === "needs-auth") ? activeSync?.retainedDetails ?? null : null);
-  const trace = authTrace ?? activeSync?.authTrace ?? null;
+  const trace = authTrace ?? activeSync?.authTrace ?? (["review", "error"].includes(status) ? [{ at: 0, event: "sync-error", result: warnings?.[0] ?? "UNEXPECTED_ERROR", phase: "status-publication", kind: "unavailable" }] : null);
   const formattedWarnings = formatUiWarnings(warnings, retainedDetails);
   const uiState = { status, message: String(message).slice(0, 500), warnings: formattedWarnings, ...(retainedDetails ? { details: retainedDetails } : {}), ...(operation ? { operation } : {}), ...((status === "running" || status === "needs-auth") && activeSync?.progressStep ? { progressStep: activeSync.progressStep } : {}), ...((status === "running" || status === "needs-auth") && activeSync?.progressStep === "fortuneo" && activeSync.fortuneoReadStep ? { fortuneoReadStep: activeSync.fortuneoReadStep } : {}), ...(Array.isArray(trace) && trace.length > 0 && ["review", "error", "needs-auth"].includes(status) ? { authTrace: trace.slice(-30) } : {}), updatedAt: new Date().toISOString(), ...((status === "running" || status === "needs-auth") && activeSync?.deadlineAt ? { startedAt: activeSync.startedAt, timeoutStartedAt: activeSync.timeoutStartedAt, deadlineAt: activeSync.deadlineAt } : {}) };
   await chrome.storage.session.set({ uiState });
@@ -1057,7 +1111,8 @@ function formatUiWarnings(warnings, details) {
     ? `${ambiguousCount || "Some"} transaction${ambiguousCount === 1 ? " was" : "s were"} skipped because the extension found multiple matching Lunch Money records. No change was made to those rows.`
     : warning === "SETTLED_CARD_REFERENCE_UNRESOLVED"
       ? "Some card bookings need review: Fortuneo no longer provides their details and their original purchase could not be identified uniquely. Those bookings were left unchanged."
-      : formatLunchMoneyFailure(warning));
+      : warning === "UNEXPECTED_ERROR" ? "An internal error stopped the sync. See diagnostics for the failing step."
+        : formatLunchMoneyFailure(warning));
 }
 
 function formatLunchMoneyFailure(warning) {
@@ -1219,18 +1274,24 @@ function syncCompletionLabel(details) {
   return `Sync complete. New transactions: ${deferred} deferred, ${pending} pending.`;
 }
 
-function syncFailureLabel(summary) {
+function syncFailureLabel(summary, fallbackPhase = "native helper processing") {
   const diagnostic = summary?.diagnostic;
   const code = typeof diagnostic?.code === "string" ? diagnostic.code : (typeof summary?.message === "string" ? summary.message : "UNEXPECTED_ERROR");
-  if (!diagnostic || typeof diagnostic.fingerprint !== "string") return `Sync failed: ${code}.`;
-  const phase = typeof diagnostic.phase === "string" ? diagnosticPhaseLabel(diagnostic.phase) : "an unknown phase";
+  if (!diagnostic) return `Sync failed during ${fallbackPhase}: ${code}. The helper supplied no exception details. Copy diagnostics to report it.`;
+  const phase = typeof diagnostic.phase === "string" ? diagnosticPhaseLabel(diagnostic.phase) : fallbackPhase;
   const kind = typeof diagnostic.kind === "string" ? diagnostic.kind : "Error";
   const location = typeof diagnostic.location === "string" ? ` at ${diagnostic.location}` : "";
-  return `Sync failed during ${phase}: ${code} (${kind}${location}; diagnostic ${diagnostic.fingerprint}).`;
+  const fingerprint = typeof diagnostic.fingerprint === "string" ? `; diagnostic ${diagnostic.fingerprint}` : "";
+  const hint = typeof diagnostic.hint === "string" ? `${diagnostic.hint}. ` : "";
+  return `Sync failed during ${phase}: ${hint}${code} (${kind}${location}${fingerprint}). Copy diagnostics to report it.`;
 }
 
 function diagnosticPhaseLabel(phase) {
   return ({
+    "validating-request": "request validation",
+    "get-fortuneo-credentials": "the saved Fortuneo credential read",
+    "get-fortuneo-account-urls": "the saved Fortuneo account read",
+    "collecting-fortuneo": "the Fortuneo data read",
     "loading-configuration": "configuration loading",
     "reading-accounts": "the Lunch Money account read",
     "planning-accounts": "account reconciliation planning",

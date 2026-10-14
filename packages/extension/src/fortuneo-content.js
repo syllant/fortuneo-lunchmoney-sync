@@ -1,6 +1,6 @@
 (() => {
 const MAX_TOTAL_BYTES = 900_000;
-const COLLECTOR_VERSION = 15;
+const COLLECTOR_VERSION = 16;
 const AUTO_LOGIN_VERSION = 4;
 const COLLECT_MESSAGE = `collect-snapshot-v${COLLECTOR_VERSION}`;
 const LOADED_KEY = `__fortuneoLunchMoneyContentLoadedV${COLLECTOR_VERSION}Auth${AUTO_LOGIN_VERSION}`;
@@ -13,7 +13,7 @@ if (!globalThis[LOADED_KEY]) {
     if (message?.type === COLLECT_MESSAGE) {
       void collectCurrentApi().then(
         (response) => sendResponse({ ...response, collectorVersion: COLLECTOR_VERSION }),
-        (error) => sendResponse({ ok: false, collectorVersion: COLLECTOR_VERSION, error: safeCode(error) }),
+        (error) => sendResponse({ ok: false, collectorVersion: COLLECTOR_VERSION, error: safeCode(error), diagnostic: collectionErrorDiagnostic(error) }),
       );
       return true;
     }
@@ -394,6 +394,16 @@ function boundPayloads(payloads) {
 function safeCode(error) {
   const message = error instanceof Error ? error.message : "FORTUNEO_READ_FAILED";
   return /^[A-Z0-9_]+$/.test(message) ? message : "FORTUNEO_READ_FAILED";
+}
+
+function collectionErrorDiagnostic(error) {
+  const kind = error instanceof SyntaxError ? "SyntaxError" : error instanceof TypeError ? "TypeError" : error instanceof RangeError ? "RangeError" : error instanceof Error ? "Error" : "NonErrorThrow";
+  const match = (error instanceof Error ? error.stack ?? "" : "").match(/fortuneo-content\.js:(\d+):(\d+)/);
+  return {
+    code: safeCode(error), phase: "collecting-fortuneo", kind,
+    ...(match ? { location: `fortuneo-content:${match[1]}:${match[2]}` } : {}),
+    hint: kind === "SyntaxError" ? "A Fortuneo response could not be parsed as JSON" : kind === "TypeError" ? "The Fortuneo read encountered an unexpected data type or a failed connection" : "The Fortuneo data read failed",
+  };
 }
 
 function notifyIfAuthenticated() {

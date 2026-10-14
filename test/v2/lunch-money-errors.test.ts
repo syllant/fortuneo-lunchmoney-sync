@@ -94,10 +94,15 @@ describe("Lunch Money failure diagnostics", () => {
       code: "UNEXPECTED_ERROR",
       phase: "building-result",
       kind: "TypeError",
+      hint: "An operation received an unexpected data type",
       location: "packages/native-host/src/sync-service.ts:147:19",
       fingerprint: expect.stringMatching(/^[A-F0-9]{12}$/),
     });
     expect(JSON.stringify(diagnostic)).not.toContain("sk_live_secret");
     expect(safeErrorDiagnostic(new SyncPhaseError("building-result", sensitive)).fingerprint).toBe(diagnostic.fingerprint);
+  });
+
+  it.each(["INVALID_ACCOUNT_SNAPSHOT", "INVALID_ACCOUNT_MASK", "INVALID_TRANSACTION_SNAPSHOT", "INVALID_SETTLEMENT_SNAPSHOT", "INVALID_SETTLEMENT_CREDIT", "INVALID_MONEY", "HMAC_KEY_TOO_SHORT", "KEYCHAIN_FORTUNEO_CREDENTIALS_INVALID", "NATIVE_RESPONSE_TOO_LARGE"])("preserves the validation cause %s", (code) => {
+    expect(safeErrorDiagnostic(new SyncPhaseError("validating-request", new Error(code)))).toMatchObject({ code, phase: "validating-request" });
   });
 });

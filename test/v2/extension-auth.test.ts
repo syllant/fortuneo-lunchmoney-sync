@@ -167,12 +167,13 @@ describe("automatic daily sync", () => {
       chromeErrorCode: () => "UNEXPECTED_ERROR",
       internalErrorKind: () => "TypeError",
       internalErrorLocation: () => "service-worker:219",
+      internalErrorHint: () => "The sync encountered an unexpected data type",
     });
     expect(setUi).toHaveBeenCalledWith(
       "error",
-      "Sync could not start during the saved Fortuneo account read: UNEXPECTED_ERROR (TypeError at service-worker:219).",
+      "Sync could not start during the saved Fortuneo account read: The sync encountered an unexpected data type (UNEXPECTED_ERROR; TypeError at service-worker:219). Copy diagnostics to report it.",
       ["UNEXPECTED_ERROR"], null, "sync",
-      [{ at: 0, event: "startup-error", stage: "reading-account-routes", result: "UNEXPECTED_ERROR", kind: "TypeError", location: "service-worker:219" }],
+      [{ at: 0, event: "startup-error", stage: "reading-account-routes", result: "UNEXPECTED_ERROR", kind: "TypeError", location: "service-worker:219", hint: "The sync encountered an unexpected data type" }],
     );
     expect(JSON.stringify(setUi.mock.calls)).not.toContain("sensitive local detail");
   });
@@ -381,7 +382,85 @@ it("renders redacted failure diagnostics with phase and source location", () => 
     location: "packages/native-host/src/sync-service.js:147:19", fingerprint: "A1B2C3D4E5F6",
   } };
   const result = runInNewContext(`${syncFailureSource}\nsyncFailureLabel(summary)`, { summary });
-  expect(result).toBe("Sync failed during final result construction: UNEXPECTED_ERROR (TypeError at packages/native-host/src/sync-service.js:147:19; diagnostic A1B2C3D4E5F6).");
+  expect(result).toBe("Sync failed during final result construction: UNEXPECTED_ERROR (TypeError at packages/native-host/src/sync-service.js:147:19; diagnostic A1B2C3D4E5F6). Copy diagnostics to report it.");
+});
+
+const syncStageSource = source.slice(source.indexOf("function syncStageLabel("), source.indexOf("async function cancelSync("));
+const failureSource = source.slice(source.indexOf("async function failActiveSync("), source.indexOf("async function cancelSync("));
+const internalErrorSource = source.slice(source.indexOf("function chromeErrorCode("), source.indexOf("async function nativeOneShot("));
+const traceSource = source.slice(source.indexOf("function traceAuth("), source.indexOf("function fortuneoPageKind("));
+const safeCodeSource = source.slice(source.indexOf("function safeCode("), source.indexOf("function cardReviewNotification("));
+
+it.each([false, true])("keeps the exception hint and diagnostics even when tab cleanup fails=%s", async (cleanupFails) => {
+  const error = new TypeError("Cannot read properties of null (reading 'private-account')");
+  error.stack = "TypeError: secret account\n at collect (chrome-extension://extension-id/service-worker.js:501:5)";
+  const sync = { requestId: "sync-1", dryRun: false, stage: "preparing-snapshot", startedAt: Date.now(), authTrace: [], port: { disconnect: vi.fn() } };
+  const setUi = vi.fn();
+  const context = { activeSync: sync, error, Error, TypeError, RangeError, SyntaxError, setUi,
+    clearFortuneoWait: vi.fn(), stopFortuneoCapture: cleanupFails ? vi.fn().mockRejectedValue(new Error("private cleanup detail")) : vi.fn(),
+  };
+  await runInNewContext(`${failureSource}\n${internalErrorSource}\n${safeCodeSource}\n${traceSource}\nfailActiveSync("sync-1", error)`, context);
+  expect(context.activeSync).toBeNull();
+  expect(setUi).toHaveBeenCalledWith("error", expect.stringContaining("Fortuneo data processing: The sync state changed"), ["UNEXPECTED_ERROR"], null, "sync", expect.arrayContaining([
+    expect.objectContaining({ event: "sync-error", kind: "state-race", location: "service-worker:501" }),
+  ]));
+  expect(JSON.stringify(setUi.mock.calls)).not.toMatch(/secret account|private-account|private cleanup detail/);
+});
+
+it("keeps context when an older helper sends no diagnostic", () => {
+  const result = runInNewContext(`${syncFailureSource}\nsyncFailureLabel({ message: "UNEXPECTED_ERROR" }, "account writes")`);
+  expect(result).toContain("during account writes");
+  expect(result).toContain("no exception details");
+});
+
+it("preserves a native preflight exception and its diagnostic trace", async () => {
+  const setUi = vi.fn();
+  const response = { type: "result", summary: { message: "UNEXPECTED_ERROR", diagnostic: { code: "UNEXPECTED_ERROR", phase: "get-fortuneo-account-urls", kind: "TypeError", fingerprint: "A1B2C3D4E5F6" } } };
+  await runInNewContext(`${startupFailureSource}\n${syncFailureSource}\nreportNativeStartupFailure("sync", "reading-account-routes", response)`, { setUi, response });
+  expect(setUi).toHaveBeenCalledWith("error", expect.stringContaining("the saved Fortuneo account read"), ["UNEXPECTED_ERROR"], null, "sync", [expect.objectContaining({ event: "startup-error", fingerprint: "A1B2C3D4E5F6" })]);
+});
+
+it("includes native failure details in Copy diagnostics after the sync is cleared", async () => {
+  const sync = { requestId: "sync-1", dryRun: false, startedAt: Date.now(), nativePhase: "reading-transactions", authTrace: [], port: { disconnect: vi.fn() } };
+  const setUi = vi.fn();
+  const context = { activeSync: sync, setUi, refreshSyncTimeout: vi.fn(), clearFortuneoWait: vi.fn(), stopFortuneoCapture: vi.fn(),
+    chrome: { storage: { local: { get: vi.fn().mockResolvedValue({}) }, session: { remove: vi.fn() } } },
+    message: { version: 2, type: "result", requestId: "sync-1", ok: false, dryRun: false, summary: { message: "UNEXPECTED_ERROR", warnings: ["UNEXPECTED_ERROR"], diagnostic: { code: "UNEXPECTED_ERROR", kind: "TypeError", fingerprint: "A1B2C3D4E5F6" } } },
+  };
+  await runInNewContext(`${nativeMessageSource}\n${syncFailureSource}\n${syncStageSource}\n${traceSource}\n${notificationSource}\nhandleNativeMessage(message)`, context);
+  expect(setUi).toHaveBeenCalledWith("review", expect.stringContaining("Lunch Money transaction read"), ["UNEXPECTED_ERROR"], null, "sync", expect.arrayContaining([expect.objectContaining({ event: "native-error", fingerprint: "A1B2C3D4E5F6" })]));
+});
+
+it("offers Copy diagnostics for a previously saved bare error", () => {
+  const popup = readFileSync(new URL("../../packages/extension/src/popup.js", import.meta.url), "utf8");
+  const debugSource = popup.slice(popup.indexOf("function renderDebugTrace("), popup.indexOf("async function copyDebugTrace("));
+  const elements = { "auth-debug": { hidden: true }, "auth-debug-log": { textContent: "" } };
+  runInNewContext(`${debugSource}\nrenderDebugTrace(null, { status: "error", message: "UNEXPECTED_ERROR", updatedAt: "2026-10-14" })`, {
+    elements, chrome: { runtime: { getManifest: () => ({ version: "2.1.52" }) } },
+  });
+  expect(elements["auth-debug"].hidden).toBe(false);
+  expect(elements["auth-debug-log"].textContent).toContain("failure-context-unavailable");
+  expect(elements["auth-debug-log"].textContent).toContain("version=2.1.52");
+});
+
+it("reports collection exceptions from tab events as terminal sync failures", async () => {
+  const collectorSource = source.slice(source.indexOf("async function collectAndForwardSnapshot("), source.indexOf("async function readAndForwardSnapshot("));
+  const error = new SyntaxError("private response");
+  const failActiveSync = vi.fn();
+  await runInNewContext(`${collectorSource}\ncollectAndForwardSnapshot("sync-1")`, {
+    readAndForwardSnapshot: vi.fn().mockRejectedValue(error), failActiveSync,
+  });
+  expect(failActiveSync).toHaveBeenCalledWith("sync-1", error);
+});
+
+it("preserves a Fortuneo parsing hint without retaining the private response", () => {
+  const content = readFileSync(new URL("../../packages/extension/src/fortuneo-content.js", import.meta.url), "utf8");
+  const diagnosticSource = content.slice(content.indexOf("function safeCode("), content.indexOf("function notifyIfAuthenticated("));
+  const error = new SyntaxError("Unexpected token private response with account 123");
+  error.stack = "SyntaxError: private response\n at collect (chrome-extension://extension-id/fortuneo-content.js:146:19)";
+  const diagnostic = runInNewContext(`${diagnosticSource}\ncollectionErrorDiagnostic(error)`, { error, Error, TypeError, SyntaxError, RangeError });
+  expect(diagnostic).toEqual({ code: "FORTUNEO_READ_FAILED", phase: "collecting-fortuneo", kind: "SyntaxError", location: "fortuneo-content:146:19", hint: "A Fortuneo response could not be parsed as JSON" });
+  expect(JSON.stringify(diagnostic)).not.toMatch(/private response|account 123|extension-id/);
 });
 
 it("serializes native progress and result messages", async () => {

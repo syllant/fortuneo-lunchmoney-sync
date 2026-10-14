@@ -4,14 +4,17 @@ import type { SafeErrorDiagnostic } from "../../shared/src/messages.js";
 const SAFE_CODES = new Set([
   "INVALID_MESSAGE_ENVELOPE", "UNKNOWN_MESSAGE_TYPE", "INVALID_CONFIGURATION", "INVALID_TOKEN",
   "INVALID_SNAPSHOT", "SNAPSHOT_LIMIT_EXCEEDED", "NATIVE_MESSAGE_SIZE_INVALID", "NATIVE_MESSAGE_JSON_INVALID",
-  "NATIVE_MESSAGE_TRUNCATED", "KEYCHAIN_READ_FAILED", "KEYCHAIN_WRITE_FAILED", "KEYCHAIN_DELETE_FAILED",
+  "NATIVE_MESSAGE_TRUNCATED", "NATIVE_RESPONSE_TOO_LARGE", "KEYCHAIN_READ_FAILED", "KEYCHAIN_WRITE_FAILED", "KEYCHAIN_DELETE_FAILED",
   "KEYCHAIN_HMAC_KEY_INVALID", "LUNCH_MONEY_AUTH_REQUIRED", "LUNCH_MONEY_REQUEST_FAILED", "NOT_CONFIGURED",
   "PAYMENT_TRANSFER_CATEGORY_NOT_FOUND", "MANAGED_TAGS_NOT_CONFIGURED", "CHECKING_ACCOUNT_NOT_FOUND",
   "TOO_MANY_PENDING_SYNCS", "UNEXPECTED_SNAPSHOT", "LUNCH_MONEY_CREATE_RESULT_INVALID",
   "UNEXPECTED_MESSAGE_PROPERTY",
   "INVALID_ACCOUNT_RELATIONSHIP", "INCONSISTENT_SNAPSHOT_COMPLETENESS", "INVALID_TRANSACTION_ACCOUNT",
   "INVALID_SETTLEMENT_ACCOUNT",
+  "INVALID_ACCOUNT_SNAPSHOT", "INVALID_ACCOUNT_MASK", "INVALID_TRANSACTION_SNAPSHOT",
+  "INVALID_SETTLEMENT_SNAPSHOT", "INVALID_SETTLEMENT_CREDIT", "INVALID_MONEY", "HMAC_KEY_TOO_SHORT",
   "INVALID_FORTUNEO_ACCOUNT_URL", "KEYCHAIN_FORTUNEO_ACCOUNT_URLS_INVALID",
+  "KEYCHAIN_FORTUNEO_CREDENTIALS_INVALID",
   "LUNCH_MONEY_TOKEN_REQUIRED",
   "INVALID_SETTLEMENT_REFERENCE",
   "FORTUNEO_SETTLED_CARD_REFERENCE_NOT_UNIQUE",
@@ -39,10 +42,18 @@ export function safeErrorDiagnostic(error: unknown): SafeErrorDiagnostic {
   const original = error instanceof SyncPhaseError ? error.original : error;
   const code = safeErrorCode(original);
   const kind = safeErrorKind(original);
+  const hint = safeErrorHint(original);
   const location = safeErrorLocation(original);
   const fingerprintSource = [code, phase ?? "unknown-phase", kind, location ?? "unknown-location", safeStackShape(original)].join("\0");
   const fingerprint = createHash("sha256").update(fingerprintSource).digest("hex").slice(0, 12).toUpperCase();
-  return { code, ...(phase ? { phase } : {}), kind, ...(location ? { location } : {}), fingerprint };
+  return { code, ...(phase ? { phase } : {}), kind, hint, ...(location ? { location } : {}), fingerprint };
+}
+
+function safeErrorHint(error: unknown): string {
+  if (error instanceof TypeError) return "An operation received an unexpected data type";
+  if (error instanceof SyntaxError) return "A response could not be parsed";
+  if (error instanceof RangeError) return "A value exceeded the supported range";
+  return "The helper reported a failure; see the error code and source location";
 }
 
 function safePhase(value: string): string | undefined {
