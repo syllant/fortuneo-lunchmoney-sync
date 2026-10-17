@@ -25,4 +25,4 @@ Treat fixtures as code: review diffs, test negative/positive signs, and confirm 
 
 ## Required cases
 
-Pending → deferred → settled, correction/refund, card replacement, duplicate fingerprint, first/second pending absence, partial response, two-card exact settlement, mismatch settlement, balance signs, expired authentication, and response-size rejection.
+Pending → deferred → settled, correction/refund, card replacement, duplicate fingerprint, first/second pending absence, partial response, two-card settlement confirmations without extra records, reference and date changes, repeated confirmations, outgoing-cycle overlap, ambiguous/missing originals, settlement amount/currency mismatches, balance signs, expired authentication, and response-size rejection.

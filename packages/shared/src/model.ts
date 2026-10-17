@@ -23,6 +23,7 @@ export interface FortuneoTransactionSnapshot {
   lifecycle: Lifecycle;
 }
 
+// Checking-history confirmations. cardCredits is retained for older snapshots only.
 export interface FortuneoSettlementSnapshot {
   sourceId: string;
   purchaseSourceId?: string;
@@ -96,7 +97,6 @@ export type ReconciliationOperation =
   | { kind: "update-transaction"; id: number; patch: Partial<DesiredTransaction>; sourceId: string; categorySource?: "history" }
   | { kind: "delete-cancelled-pending"; id: number; sourceIdentity: string }
   | { kind: "delete-replaced-synthetic"; id: number }
-  | { kind: "group-settlement"; sourceId: string; date: string; memberSourceIds: string[]; categoryId: number }
   | { kind: "review"; code: string; subject: string };
 
 export interface ReconciliationPlan {
@@ -108,5 +108,4 @@ export interface ManagedIds {
   checkingAccountId: number;
   pendingTagId: number;
   deferredTagId: number;
-  paymentTransferCategoryId: number;
 }

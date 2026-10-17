@@ -23,13 +23,10 @@ export type LunchMoneyOperation =
   | "UPDATE_BALANCE"
   | "READ_TAGS"
   | "WRITE_TAG"
-  | "READ_CATEGORIES"
-  | "WRITE_CATEGORY"
   | "READ_TRANSACTIONS"
   | "CREATE_TRANSACTION"
   | "UPDATE_TRANSACTION"
-  | "DELETE_TRANSACTION"
-  | "GROUP_TRANSACTIONS";
+  | "DELETE_TRANSACTION";
 
 export class LunchMoneyGateway {
   private readonly client: LunchMoneyClient;
@@ -78,10 +75,7 @@ export class LunchMoneyGateway {
   }
 
   async ensureManagedIds(checkingAccountId: number, createMissing = true): Promise<ManagedIds> {
-    const [tags, categories] = await Promise.all([
-      this.call("READ_TAGS", () => this.client.tags.getAll()),
-      this.call("READ_CATEGORIES", () => this.client.categories.getAll({ format: "nested" })),
-    ]);
+    const tags = await this.call("READ_TAGS", () => this.client.tags.getAll());
     let pending = tags.find((tag) => tag.name === "Fortuneo pending" && !tag.archived);
     let deferred = tags.find((tag) => tag.name === "Fortuneo deferred" && !tag.archived);
     if (createMissing) {
@@ -89,33 +83,7 @@ export class LunchMoneyGateway {
       deferred ??= await this.call("WRITE_TAG", () => this.client.tags.create({ name: "Fortuneo deferred", description: "Managed by Fortuneo Lunch Money Sync" }));
     }
     if (!pending || !deferred) throw new Error("MANAGED_TAGS_NOT_CONFIGURED");
-    const categoryCandidates = flattenCategories(categories);
-    let transfer = chooseTransferCategory(categoryCandidates);
-    const archivedDefault = categoryCandidates.find((category) => !category.isGroup && category.archived && normalizeCategoryName(category.name) === "payment transfer");
-    if (!transfer && createMissing && archivedDefault) {
-      const restored = await this.call("WRITE_CATEGORY", () => this.client.categories.update(archivedDefault.id, { archived: false, is_income: false, exclude_from_budget: true, exclude_from_totals: true }));
-      transfer = toTransferCandidate(restored);
-    }
-    if (!transfer && createMissing) {
-      const name = categoryCandidates.some((category) => normalizeCategoryName(category.name) === "payment transfer") ? "Fortuneo transfers" : "Payment, Transfer";
-      const created = await this.call("WRITE_CATEGORY", () => this.client.categories.create({
-        name,
-        description: "Transfers between accounts",
-        is_income: false,
-        exclude_from_budget: true,
-        exclude_from_totals: true,
-        is_group: false,
-        archived: false,
-      }));
-      transfer = toTransferCandidate(created);
-    }
-    if (!transfer) throw new Error("PAYMENT_TRANSFER_CATEGORY_NOT_FOUND");
-    if (createMissing && (transfer.isIncome || !transfer.excludeFromBudget || !transfer.excludeFromTotals)) {
-      const transferId = transfer.id;
-      const corrected = await this.call("WRITE_CATEGORY", () => this.client.categories.update(transferId, { is_income: false, exclude_from_budget: true, exclude_from_totals: true }));
-      transfer = toTransferCandidate(corrected);
-    }
-    return { checkingAccountId, pendingTagId: pending.id, deferredTagId: deferred.id, paymentTransferCategoryId: transfer.id };
+    return { checkingAccountId, pendingTagId: pending.id, deferredTagId: deferred.id };
   }
 
   async listTransactions(snapshotDate: string): Promise<ExistingTransaction[]> {
@@ -183,11 +151,6 @@ export class LunchMoneyGateway {
 
   async deleteTransaction(id: number): Promise<void> {
     await this.call("DELETE_TRANSACTION", () => this.client.transactions.delete(id));
-  }
-
-  async groupTransactions(ids: number[], date: string, categoryId: number): Promise<number> {
-    const group = await this.call("GROUP_TRANSACTIONS", () => this.client.transactions.group({ ids, date, payee: "Fortuneo card payment", category_id: categoryId, status: "reviewed", tag_ids: [] }));
-    return group.id;
   }
 
   private async call<T>(operation: LunchMoneyOperation, request: () => Promise<T>): Promise<T> {
@@ -273,54 +236,4 @@ function parseMetadata(value: unknown): IntegrationMetadata | null {
 
 function metadataRecord(metadata: IntegrationMetadata): Record<string, unknown> {
   return { ...metadata };
-}
-
-export interface TransferCategoryCandidate {
-  id: number;
-  name: string;
-  isGroup: boolean;
-  isIncome: boolean;
-  excludeFromBudget: boolean;
-  excludeFromTotals: boolean;
-  archived: boolean;
-}
-
-export function chooseTransferCategory(categories: readonly TransferCategoryCandidate[]): TransferCategoryCandidate | null {
-  const assignable = categories.filter((category) => !category.isGroup && !category.archived);
-  const exact = assignable.find((category) => normalizeCategoryName(category.name) === "payment transfer");
-  if (exact) return exact;
-  const semantic = assignable.filter((category) => !category.isIncome && category.excludeFromBudget && category.excludeFromTotals);
-  const named = semantic.filter((category) => /\b(payment|transfer|paiement|virement)\b/u.test(normalizeCategoryName(category.name)));
-  if (named.length === 1) return named[0] ?? null;
-  return semantic.length === 1 ? semantic[0] ?? null : null;
-}
-
-function flattenCategories(categories: readonly unknown[]): TransferCategoryCandidate[] {
-  const output: TransferCategoryCandidate[] = [];
-  const visit = (value: unknown): void => {
-    if (typeof value !== "object" || value === null) return;
-    const category = value as Record<string, unknown>;
-    if (typeof category.id === "number" && typeof category.name === "string") {
-      output.push({
-        id: category.id,
-        name: category.name,
-        isGroup: category.is_group === true,
-        isIncome: category.is_income === true,
-        excludeFromBudget: category.exclude_from_budget === true,
-        excludeFromTotals: category.exclude_from_totals === true,
-        archived: category.archived === true,
-      });
-    }
-    if (Array.isArray(category.children)) category.children.forEach(visit);
-  };
-  categories.forEach(visit);
-  return output;
-}
-
-function normalizeCategoryName(value: string): string {
-  return value.normalize("NFKD").replace(/\p{Diacritic}/gu, "").toLocaleLowerCase("en").replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-function toTransferCandidate(category: { id: number; name: string; is_group: boolean; is_income: boolean; exclude_from_budget: boolean; exclude_from_totals: boolean; archived: boolean }): TransferCategoryCandidate {
-  return { id: category.id, name: category.name, isGroup: category.is_group, isIncome: category.is_income, excludeFromBudget: category.exclude_from_budget, excludeFromTotals: category.exclude_from_totals, archived: category.archived };
 }

@@ -1,10 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { IdentityService } from "../../packages/shared/src/identity.js";
 import type { ExistingAccount, ExistingTransaction, FortuneoSnapshot, ReconciliationOperation } from "../../packages/shared/src/model.js";
 import type { NativeResponse, ResultSummary } from "../../packages/shared/src/messages.js";
 import type { KeychainStore } from "../../packages/native-host/src/keychain.js";
 import { buildResultDetails, simulateDryRunAccounts, SyncService, unresolvedCardReviewKeys } from "../../packages/native-host/src/sync-service.js";
-import { cardAccountName, type LunchMoneyGateway } from "../../packages/native-host/src/lunch-money.js";
+import { cardAccountName, LunchMoneyGateway } from "../../packages/native-host/src/lunch-money.js";
 
 describe("dry-run account simulation", () => {
   it("reports completed writes throughout a sync longer than the idle timeout", async () => {
@@ -18,22 +18,19 @@ describe("dry-run account simulation", () => {
     const gateway = {
       createTransaction: async () => { elapsed += 40_000; return nextId++; },
       updateTransactions: async () => { elapsed += 40_000; },
-      groupTransactions: async () => { elapsed += 40_000; return nextId++; },
     } as unknown as LunchMoneyGateway;
-    const snapshot: FortuneoSnapshot = { capturedAt: "2026-10-01T00:00:00.000Z", complete: false, accounts: [], transactions: [], settlements: [] };
     const operations: ReconciliationOperation[] = Array.from({ length: 4 }, (_, index) => ({ kind: "create-transaction", sourceId: `tx-${index}`, transaction: {
       accountId: index % 2 ? 11 : 10, date: "2026-09-30", amount: index % 2 ? "-1" : "1", currency: "eur", payee: "Payment", tagIds: [],
-      externalId: identity.transactionExternalId(`tx-${index}`), metadata: { schema_version: 2, source_identity: identity.digest("transaction", `tx-${index}`), lifecycle: "settlement", payload_fingerprint: "test", last_seen_at: snapshot.capturedAt, miss_count: 0, aliases: [] },
+      externalId: identity.transactionExternalId(`tx-${index}`), metadata: { schema_version: 2, source_identity: identity.digest("transaction", `tx-${index}`), lifecycle: "settlement", payload_fingerprint: "test", last_seen_at: "2026-10-01T00:00:00.000Z", miss_count: 0, aliases: [] },
     } }));
-    operations.push({ kind: "group-settlement", sourceId: "payment", date: "2026-09-30", memberSourceIds: ["tx-0", "tx-1"], categoryId: 30 });
-    const summary: ResultSummary = { created: 0, updated: 0, deleted: 0, grouped: 0, warnings: [], message: "test", breakdown: {
-      accountsCreated: 0, accountsUpdated: 0, transactionsCreated: 0, transactionsUpdated: 0, transactionsDeleted: 0, settlementsGrouped: 0, fortuneoSettled: 0, fortuneoDeferred: 0, fortuneoPending: 0,
+    const summary: ResultSummary = { created: 0, updated: 0, deleted: 0, warnings: [], message: "test", breakdown: {
+      accountsCreated: 0, accountsUpdated: 0, transactionsCreated: 0, transactionsUpdated: 0, transactionsDeleted: 0, fortuneoSettled: 0, fortuneoDeferred: 0, fortuneoPending: 0,
     } };
-    const writer = service as unknown as { applyTransactions(gateway: LunchMoneyGateway, operations: ReconciliationOperation[], existing: ExistingTransaction[], snapshot: FortuneoSnapshot, identity: IdentityService, summary: ResultSummary, requestId: string): Promise<void> };
-    await writer.applyTransactions(gateway, operations, [], snapshot, identity, summary, "test-request");
+    const writer = service as unknown as { applyTransactions(gateway: LunchMoneyGateway, operations: ReconciliationOperation[], summary: ResultSummary, requestId: string): Promise<void> };
+    await writer.applyTransactions(gateway, operations, summary, "test-request");
     expect(elapsed).toBeGreaterThan(60_000);
-    expect(summary).toMatchObject({ created: 4, grouped: 1 });
-    expect(progressTimes).toHaveLength(6);
+    expect(summary).toMatchObject({ created: 4 });
+    expect(progressTimes).toHaveLength(5);
     expect(progressTimes.every((time, index) => time - (progressTimes[index - 1] ?? 0) < 60_000)).toBe(true);
   });
   it("makes planned card accounts available to transaction reconciliation without writing them", () => {
@@ -141,5 +138,55 @@ describe("card review identities", () => {
     transactions[0]!.amount = "-0.45";
     expect(unresolvedCardReviewKeys(snapshot, operations, identity)[0]).not.toBe(keys[0]);
     expect(unresolvedCardReviewKeys(snapshot, [], identity)).toEqual([]);
+  });
+});
+
+
+describe("cycle confirmation through the native sync service", () => {
+  it.each([true, false])("preserves one purchase and authoritative balances in dryRun=%s", async (dryRun) => {
+    const key = Buffer.alloc(32, 7);
+    const identity = new IdentityService(key);
+    const capturedAt = "2026-10-01T00:00:00.000Z";
+    const metadata = { schema_version: 2 as const, source_identity: identity.digest("transaction", "purchase"), lifecycle: "deferred" as const,
+      payload_fingerprint: "original-fingerprint", last_seen_at: "2026-09-20T00:00:00Z", miss_count: 0, aliases: [] };
+    const existing: ExistingTransaction = { id: 100, accountId: 11, date: "2026-09-19", amount: "54.02", currency: "eur", payee: "My merchant",
+      notes: "My note", categoryId: 99, tagIds: [21, 88], externalId: identity.transactionExternalId("purchase"), metadata, groupParentId: null };
+    const accounts: ExistingAccount[] = [
+      { id: 10, name: "Checking", type: "cash", balance: "500", currency: "eur", externalId: identity.accountExternalId("checking"), metadata: { ...metadata, lifecycle: "account", source_identity: identity.digest("account", "checking") } },
+      { id: 11, name: "Card", type: "credit", balance: "54.02", currency: "eur", externalId: identity.accountExternalId("card"), metadata: null },
+    ];
+    const snapshot: FortuneoSnapshot = { capturedAt, complete: false,
+      accounts: [{ sourceId: "checking", kind: "checking", displayName: "Checking", balance: "500", currency: "eur", complete: false },
+        { sourceId: "card", kind: "card", displayName: "Card", balance: "0", currency: "eur", complete: false }],
+      transactions: [{ sourceId: "purchase", accountSourceId: "card", date: "2026-09-18", amount: "54.02", currency: "eur", merchant: "Provider merchant", lifecycle: "settled" }],
+      settlements: [{ sourceId: "booking", purchaseSourceId: "purchase", checkingAccountSourceId: "checking", date: "2026-09-30", checkingDebit: "54.02", currency: "eur", cardCredits: [] }],
+    };
+    const responses: NativeResponse[] = [];
+    const keychain = { getToken: async () => "test-token", getCheckingAccountId: async () => 10, getOrCreateHmacKey: async () => key } as unknown as KeychainStore;
+    const service = new SyncService(keychain, (response) => responses.push(response));
+    const listAccounts = vi.spyOn(LunchMoneyGateway.prototype, "listAccounts").mockResolvedValue(accounts);
+    vi.spyOn(LunchMoneyGateway.prototype, "listTransactions").mockResolvedValue([existing]);
+    vi.spyOn(LunchMoneyGateway.prototype, "ensureManagedIds").mockResolvedValue({ checkingAccountId: 10, pendingTagId: 20, deferredTagId: 21 });
+    const updates = vi.spyOn(LunchMoneyGateway.prototype, "updateTransactions").mockResolvedValue();
+    const balances = vi.spyOn(LunchMoneyGateway.prototype, "updateBalance").mockResolvedValue();
+    const create = vi.spyOn(LunchMoneyGateway.prototype, "createTransaction").mockResolvedValue(999);
+    const remove = vi.spyOn(LunchMoneyGateway.prototype, "deleteTransaction").mockResolvedValue();
+    try {
+      await service.handle({ version: 2, type: dryRun ? "dry-run" : "sync", requestId: "cycle" });
+      await service.handle({ version: 2, type: "snapshot", requestId: "cycle", snapshot });
+      expect(responses).toContainEqual(expect.objectContaining({ type: "result", ok: true, summary: expect.objectContaining({ created: 0, updated: 1, deleted: 0, warnings: [] }) }));
+      expect(create).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(listAccounts).toHaveBeenCalledTimes(1);
+      if (dryRun) {
+        expect(updates).not.toHaveBeenCalled();
+        expect(balances).not.toHaveBeenCalled();
+      } else {
+        expect(updates).toHaveBeenCalledExactlyOnceWith([{ id: 100, patch: { tagIds: [88], metadata: { ...metadata, lifecycle: "settled", last_seen_at: capturedAt } } }]);
+        expect(balances).toHaveBeenCalledWith(10, "500", "eur", capturedAt);
+        expect(balances).toHaveBeenCalledWith(11, "0", "eur", capturedAt);
+      }
+      expect(existing).toMatchObject({ date: "2026-09-19", payee: "My merchant", categoryId: 99, amount: "54.02", notes: "My note" });
+    } finally { vi.restoreAllMocks(); }
   });
 });

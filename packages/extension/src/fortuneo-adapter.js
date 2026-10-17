@@ -64,10 +64,10 @@ function adaptCurrentApi(payloads) {
     registerCurrentCard(cardInfo, cardId, detail);
     // Keep the card operation reference separate from its checking booking ID.
     const sourceId = originalOperationId ?? `card:${cardId}:${purchaseId}`;
-    transactions.push(parsed, { ...parsed, sourceId, accountSourceId: cardId, date: purchaseDate, merchant });
-    settlements.push({ sourceId: parsed.sourceId, checkingAccountSourceId: checkingId, date: parsed.date,
+    transactions.push({ ...parsed, sourceId, accountSourceId: cardId, date: purchaseDate, merchant });
+    settlements.push({ sourceId: parsed.sourceId, purchaseSourceId: sourceId, checkingAccountSourceId: checkingId, date: parsed.date,
       checkingDebit: parsed.amount, currency: parsed.currency,
-      cardCredits: [{ cardAccountSourceId: cardId, amount: invertMoney(parsed.amount) }] });
+      cardCredits: [] });
   }
   for (const item of pending) {
     const cardId = currentCardId(item) ?? `pending-card:${checkingId}`;
@@ -81,13 +81,15 @@ function adaptCurrentApi(payloads) {
     const parsed = parseCurrentTransaction(item, cardId, "deferred", fallbackDate);
     if (parsed) transactions.push(parsed);
   }
+  // A settled purchase can still appear in the outgoing cycle's deferred list.
+  const uniqueTransactions = deduplicate([...transactions, ...transactions.filter((item) => item.lifecycle === "settled")], (item) => `${item.accountSourceId}\0${item.sourceId}`);
   const cardBalances = new Map();
-  for (const transaction of transactions.filter((item) => item.accountSourceId !== checkingId && item.lifecycle !== "settled")) {
+  for (const transaction of uniqueTransactions.filter((item) => item.accountSourceId !== checkingId && item.lifecycle !== "settled")) {
     cardBalances.set(transaction.accountSourceId, (cardBalances.get(transaction.accountSourceId) ?? 0) + Number(transaction.amount));
   }
   const accounts = [{ sourceId: checkingId, kind: accountKind, displayName: checkingName, currency: currency.toLowerCase(), balance: normalizeMoney(balance), complete: false }];
   for (const [sourceId, info] of cardInfo) accounts.push({ sourceId, kind: "card", displayName: info.displayName, currency: currency.toLowerCase(), balance: normalizeMoney(String(cardBalances.get(sourceId) ?? 0)), complete: false, ...(info.mask ? { mask: info.mask } : {}) });
-  return { capturedAt: new Date().toISOString(), complete: false, accounts, transactions: deduplicate(transactions, (item) => `${item.accountSourceId}\0${item.sourceId}`), settlements: deduplicate(settlements, (item) => item.sourceId) };
+  return { capturedAt: new Date().toISOString(), complete: false, accounts, transactions: uniqueTransactions, settlements: deduplicate(settlements, (item) => item.sourceId) };
 }
 
 function currentAccountKind(value) {

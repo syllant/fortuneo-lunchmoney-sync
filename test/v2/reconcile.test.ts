@@ -4,7 +4,7 @@ import type { ExistingAccount, ExistingTransaction, FortuneoSnapshot, ManagedIds
 import { planAccounts, planTransactions } from "../../packages/shared/src/reconcile.js";
 
 const identity = new IdentityService(Buffer.alloc(32, 7));
-const ids: ManagedIds = { checkingAccountId: 10, pendingTagId: 20, deferredTagId: 21, paymentTransferCategoryId: 30 };
+const ids: ManagedIds = { checkingAccountId: 10, pendingTagId: 20, deferredTagId: 21 };
 const accounts: ExistingAccount[] = [
   { id: 10, name: "Fortuneo checking", type: "cash", balance: "1000", currency: "eur", externalId: identity.accountExternalId("checking"), metadata: null },
   { id: 11, name: "World Elite", type: "credit", balance: "0", currency: "eur", externalId: identity.accountExternalId("world"), metadata: null },
@@ -153,27 +153,12 @@ describe("transaction reconciliation", () => {
     expect(plan.operations.filter((operation) => operation.kind === "update-transaction")).toHaveLength(2);
   });
 
-  it("creates card credits and one net-zero group only for an exact settlement", () => {
+  it("ignores legacy settlement mirrors and never recreates their transfer offsets", () => {
     const snapshot = baseSnapshot();
-    snapshot.transactions = [{ sourceId: "settle-1", accountSourceId: "checking", date: "2026-08-25", amount: "150", currency: "eur", merchant: "CARTE DIFFEREE", lifecycle: "settled" }];
-    snapshot.settlements = [{ sourceId: "settle-1", checkingAccountSourceId: "checking", date: "2026-08-25", checkingDebit: "150", currency: "eur", cardCredits: [{ cardAccountSourceId: "world", amount: "-100" }, { cardAccountSourceId: "gold", amount: "-50" }] }];
+    snapshot.transactions = [{ sourceId: "payment", accountSourceId: "checking", date: "2026-08-25", amount: "100", currency: "eur", merchant: "CARTE DIFFEREE", lifecycle: "settled" }];
+    snapshot.settlements = [{ sourceId: "payment", checkingAccountSourceId: "checking", date: "2026-08-25", checkingDebit: "100", currency: "eur", cardCredits: [{ cardAccountSourceId: "world", amount: "-100" }] }];
     const plan = planTransactions(snapshot, accounts, [], identity, ids);
-    expect(plan.operations.filter((operation) => operation.kind === "create-transaction")).toHaveLength(3);
-    expect(plan.operations).toContainEqual(expect.objectContaining({ kind: "group-settlement", memberSourceIds: ["settle-1", "settle-1\0world", "settle-1\0gold"] }));
-    expect(plan.warnings).toHaveLength(0);
-  });
-
-  it("categorizes a recognizable debit but refuses grouping on mismatch", () => {
-    const snapshot = baseSnapshot();
-    snapshot.transactions = [{ sourceId: "settle-2", accountSourceId: "checking", date: "2026-08-25", amount: "151", currency: "eur", merchant: "CARTE DIFFEREE", lifecycle: "settled" }];
-    snapshot.settlements = [{ sourceId: "settle-2", checkingAccountSourceId: "checking", date: "2026-08-25", checkingDebit: "151", currency: "eur", cardCredits: [{ cardAccountSourceId: "world", amount: "-150" }] }];
-    const original = planTransactions({ ...snapshot, settlements: [] }, accounts, [], identity, ids).operations.find((operation) => operation.kind === "create-transaction");
-    if (original?.kind !== "create-transaction") throw new Error("missing create");
-    const existing: ExistingTransaction = { id: 500, accountId: 10, date: "2026-08-25", amount: "151", currency: "eur", payee: "Edited", notes: null, categoryId: null, tagIds: [], externalId: original.transaction.externalId, metadata: original.transaction.metadata, groupParentId: null };
-    const plan = planTransactions(snapshot, accounts, [existing], identity, ids);
-    expect(plan.warnings).toContain("SETTLEMENT_TOTAL_MISMATCH");
-    expect(plan.operations).toContainEqual(expect.objectContaining({ kind: "update-transaction", id: 500, patch: expect.objectContaining({ categoryId: 30 }) }));
-    expect(plan.operations.some((operation) => operation.kind === "group-settlement")).toBe(false);
+    expect(plan.operations).toEqual([{ kind: "review", code: "SETTLED_CARD_REFERENCE_UNRESOLVED", subject: identity.digest("transaction", "payment") }]);
   });
 
   it("adopts a uniquely matching v1 checking transaction without the old HMAC key", () => {

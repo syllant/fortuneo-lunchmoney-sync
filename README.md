@@ -9,7 +9,7 @@ A personal, local-first synchronizer for Google Chrome on macOS. Opening [Lunch 
 - One selected Lunch Money checking account, one `cash`/`savings` account per Fortuneo savings identity, plus one `credit` manual account per stable card identity.
 - The checking account uses Fortuneo's projected balance, including pending and deferred payment families; card balances represent their outstanding activity.
 - Card purchases stay on the card account through pending → deferred → settled lifecycle changes.
-- A monthly checking debit and per-card credits are grouped only when their sum is exactly zero.
+- Cycle-end checking postings confirm existing card purchases. Settlement clears the deferred tag while preserving the purchase account, date, merchant, amount, category, and notes. No checking duplicate, payment credit, or transaction group is created. Unmatched or ambiguous confirmations require review instead of creating historical purchases.
 - Lunch Money `custom_metadata` is the reconciliation store; Chrome stores only local-date throttling and UI state.
 - Fortuneo credentials, discovered account routes, the Lunch Money token, checking-account ID, and a random 256-bit HMAC key are stored in macOS Keychain under `com.sylvaindurand.fortuneo-lunchmoney-sync`.
 - When the short Fortuneo browser session expires, the extension makes one automatic sign-in attempt. It stops and requests manual authentication for an invalid login or a strong-authentication challenge.
@@ -58,7 +58,7 @@ The extension passively captures bounded same-origin JSON responses in memory wh
 1. Open or reload the authenticated Fortuneo accounts page so the extension can observe the account, card-operation, and checking-operation JSON responses.
 2. Sanitize representative responses according to [docs/fixtures.md](docs/fixtures.md); do not commit identifiers, merchants, dates, amounts, cookies, or responses from the real account.
 3. Add adapter fixtures and tests for every observed response shape.
-4. Run **Preview changes** against the test budget and compare counts, signs, lifecycle state, card assignment, and settlement totals.
+4. Run **Preview changes** against the test budget and compare counts, signs, lifecycle state, card assignment, and settlement confirmations.
 5. Follow [docs/rollout.md](docs/rollout.md) before allowing the first local write.
 
 The generic adapter recognizes conservative field aliases, assumes conventional bank signs (provider debits negative; Lunch Money debits positive), and marks a snapshot complete only when the response explicitly says it is complete. A shape that cannot provide a stable operation/account ID is rejected.

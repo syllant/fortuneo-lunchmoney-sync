@@ -1,6 +1,6 @@
 import { IdentityService } from "../../shared/src/identity.js";
 import type { NativeRequest, NativeResponse, ResultSummary, SyncResultDetails } from "../../shared/src/messages.js";
-import type { ExistingAccount, ExistingTransaction, FortuneoSnapshot, ReconciliationOperation } from "../../shared/src/model.js";
+import type { ExistingAccount, FortuneoSnapshot, ReconciliationOperation } from "../../shared/src/model.js";
 import { planAccounts, planTransactions } from "../../shared/src/reconcile.js";
 import { resolveSettledCardReferences } from "../../shared/src/settled-cards.js";
 import type { KeychainStore } from "./keychain.js";
@@ -151,7 +151,7 @@ export class SyncService {
         summary.warnings.push(...transactionPlan.warnings);
         this.progress(requestId, "writing-transactions");
         phase = "writing-transactions";
-        await this.applyTransactions(gateway, transactionPlan.operations, existing, snapshot, identity, summary, requestId);
+        await this.applyTransactions(gateway, transactionPlan.operations, summary, requestId);
         this.progress(requestId, "updating-balances");
         phase = "updating-balances";
         for (const operation of balanceOps) {
@@ -184,18 +184,13 @@ export class SyncService {
   private async applyTransactions(
     gateway: LunchMoneyGateway,
     operations: readonly ReconciliationOperation[],
-    existing: readonly ExistingTransaction[],
-    snapshot: FortuneoSnapshot,
-    identity: IdentityService,
     summary: ResultSummary,
     requestId: string,
   ): Promise<void> {
-    const sourceToId = existingSourceMap(existing, snapshot, identity);
     const updates = operations.filter((operation) => operation.kind === "update-transaction");
     for (const operation of operations) {
       if (operation.kind === "create-transaction") {
-        const id = await gateway.createTransaction(operation.transaction);
-        sourceToId.set(operation.sourceId, id);
+        await gateway.createTransaction(operation.transaction);
         summary.created += 1;
         summary.breakdown.transactionsCreated += 1;
         this.progress(requestId, "writing-transactions");
@@ -208,26 +203,8 @@ export class SyncService {
     }
     await gateway.updateTransactions(updates.map((operation) => ({ id: operation.id, patch: operation.patch })));
     this.progress(requestId, "writing-transactions");
-    for (const operation of updates) {
-      sourceToId.set(operation.sourceId, operation.id);
-      summary.updated += 1;
-      summary.breakdown.transactionsUpdated += 1;
-    }
-    for (const operation of operations) {
-      if (operation.kind !== "group-settlement") continue;
-      const memberIds = operation.memberSourceIds.map((sourceId) => sourceToId.get(sourceId));
-      if (memberIds.some((id) => id === undefined)) {
-        summary.warnings.push("SETTLEMENT_GROUP_MEMBER_MISSING");
-        continue;
-      }
-      const ids = memberIds as number[];
-      const groupParents = ids.map((id) => existing.find((transaction) => transaction.id === id)?.groupParentId).filter((id): id is number => id !== null && id !== undefined);
-      if (groupParents.length === ids.length && new Set(groupParents).size === 1) continue;
-      await gateway.groupTransactions(ids, operation.date, operation.categoryId);
-      summary.grouped += 1;
-      summary.breakdown.settlementsGrouped += 1;
-      this.progress(requestId, "writing-transactions");
-    }
+    summary.updated += updates.length;
+    summary.breakdown.transactionsUpdated += updates.length;
   }
 
   private progress(requestId: string, phase: string): void {
@@ -299,7 +276,7 @@ export function buildResultDetails(
 }
 
 function reviewIssue(code: string): string {
-  return ({ AMBIGUOUS_FINGERPRINT: "Multiple Lunch Money matches", ACCOUNT_MAPPING_MISSING: "No Lunch Money account mapping", SETTLED_CARD_REFERENCE_UNRESOLVED: "Card detail unavailable; no unique original purchase. This booking is unchanged and needs review." } as Record<string, string>)[code] ?? "Could not reconcile safely";
+  return ({ AMBIGUOUS_FINGERPRINT: "Multiple Lunch Money matches", ACCOUNT_MAPPING_MISSING: "No Lunch Money account mapping", SETTLED_CARD_REFERENCE_MISMATCH: "The settlement amount or currency differs from the original purchase. No transaction was changed.", SETTLED_CARD_PURCHASE_GROUPED: "The original purchase belongs to a group and needs review.", SETTLED_CARD_REFERENCE_UNRESOLVED: "Original card purchase could not be identified uniquely; it needs review. No transaction was created." } as Record<string, string>)[code] ?? "Could not reconcile safely";
 }
 
 export function simulateDryRunAccounts(accounts: readonly ExistingAccount[], operations: readonly ReconciliationOperation[]): ExistingAccount[] {
@@ -324,20 +301,6 @@ export function simulateDryRunAccounts(accounts: readonly ExistingAccount[], ope
   return simulated;
 }
 
-function existingSourceMap(existing: readonly ExistingTransaction[], snapshot: FortuneoSnapshot, identity: IdentityService): Map<string, number> {
-  const map = new Map<string, number>();
-  const sourceIds = [
-    ...snapshot.transactions.map((transaction) => transaction.sourceId),
-    ...snapshot.settlements.flatMap((settlement) => [settlement.sourceId, ...settlement.cardCredits.map((credit) => `${settlement.sourceId}\0${credit.cardAccountSourceId}`)]),
-  ];
-  for (const sourceId of sourceIds) {
-    const sourceIdentity = identity.digest("transaction", sourceId);
-    const found = existing.find((transaction) => transaction.metadata?.source_identity === sourceIdentity || transaction.metadata?.aliases.includes(sourceIdentity));
-    if (found) map.set(sourceId, found.id);
-  }
-  return map;
-}
-
 function countDryRun(operations: readonly ReconciliationOperation[], summary: ResultSummary): void {
   for (const operation of operations) {
     if (operation.kind === "create-transaction") {
@@ -355,9 +318,6 @@ function countDryRun(operations: readonly ReconciliationOperation[], summary: Re
     } else if (operation.kind === "delete-cancelled-pending" || operation.kind === "delete-replaced-synthetic") {
       summary.deleted += 1;
       summary.breakdown.transactionsDeleted += 1;
-    } else if (operation.kind === "group-settlement") {
-      summary.grouped += 1;
-      summary.breakdown.settlementsGrouped += 1;
     }
   }
 }
@@ -367,7 +327,6 @@ function emptySummary(message: string): ResultSummary {
     created: 0,
     updated: 0,
     deleted: 0,
-    grouped: 0,
     warnings: [],
     message,
     breakdown: {
@@ -376,7 +335,6 @@ function emptySummary(message: string): ResultSummary {
       transactionsCreated: 0,
       transactionsUpdated: 0,
       transactionsDeleted: 0,
-      settlementsGrouped: 0,
       fortuneoSettled: 0,
       fortuneoDeferred: 0,
       fortuneoPending: 0,

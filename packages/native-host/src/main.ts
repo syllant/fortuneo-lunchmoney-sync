@@ -15,7 +15,6 @@ function errorSummary(error: unknown): ResultSummary {
     created: 0,
     updated: 0,
     deleted: 0,
-    grouped: 0,
     warnings: [code],
     message: code,
     breakdown: {
@@ -24,7 +23,6 @@ function errorSummary(error: unknown): ResultSummary {
       transactionsCreated: 0,
       transactionsUpdated: 0,
       transactionsDeleted: 0,
-      settlementsGrouped: 0,
       fortuneoSettled: 0,
       fortuneoDeferred: 0,
       fortuneoPending: 0,

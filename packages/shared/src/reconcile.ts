@@ -1,5 +1,5 @@
 import type { IdentityService } from "./identity.js";
-import { negateMoney, parseMinor } from "./money.js";
+import { parseMinor } from "./money.js";
 import type {
   DesiredTransaction,
   ExistingAccount,
@@ -78,15 +78,65 @@ export function planTransactions(
   const managed = transactions.filter((transaction) => transaction.metadata?.schema_version === 2);
   const legacyChecking = transactions.filter((transaction) => transaction.accountId === ids.checkingAccountId && transaction.externalId?.startsWith("lmft:v1:") === true);
   const matchedIds = new Set<number>();
-  const sourceIdToTransactionId = new Map<string, number>();
-  const unresolvedCardBookings = new Set(snapshot.settlements.filter((settlement) => settlement.purchaseSourceId).map((settlement) => `${settlement.checkingAccountSourceId}\0${settlement.sourceId}`));
+  const checkingBookings = new Map(snapshot.settlements.map((settlement) => [`${settlement.checkingAccountSourceId}\0${settlement.sourceId}`, settlement]));
+  const purchaseReferences = new Set(snapshot.settlements.flatMap((settlement) => settlement.purchaseSourceId ? [settlement.purchaseSourceId] : []));
+  // Older extension snapshots identify the affected card through cardCredits.
+  // Accept them as confirmations too, without creating their former offsets.
+  const legacyCards = new Set(snapshot.settlements.flatMap((settlement) => settlement.cardCredits.map((credit) => credit.cardAccountSourceId)));
+  const isConfirmation = (source: FortuneoTransactionSnapshot): boolean => source.lifecycle === "settled"
+    && snapshot.accounts.some((account) => account.sourceId === source.accountSourceId && account.kind === "card")
+    && (purchaseReferences.has(source.sourceId) || legacyCards.has(source.accountSourceId));
+  const confirmedIds = new Set<number>();
+  for (const source of snapshot.transactions.filter(isConfirmation)) {
+    const accountId = sourceAccountToBudget.get(source.accountSourceId);
+    if (!accountId) {
+      addReview(operations, warnings, "ACCOUNT_MAPPING_MISSING", identity.digest("transaction", source.sourceId));
+      continue;
+    }
+    const sourceIdentity = identity.digest("transaction", source.sourceId);
+    const candidates = managed.filter((candidate) => candidate.accountId === accountId && ["pending", "deferred", "settled"].includes(candidate.metadata!.lifecycle)
+      && (candidate.metadata?.source_identity === sourceIdentity || candidate.metadata?.aliases.includes(sourceIdentity)));
+    const matches = candidates.length > 0 ? candidates : managed.filter((candidate) => candidate.accountId === accountId
+      && ["pending", "deferred", "settled"].includes(candidate.metadata!.lifecycle)
+      && candidate.metadata?.payload_fingerprint === transactionFingerprint(source, identity));
+    if (matches.length !== 1) {
+      addReview(operations, warnings, "SETTLED_CARD_REFERENCE_UNRESOLVED", sourceIdentity);
+      continue;
+    }
+    const match = matches[0]!;
+    matchedIds.add(match.id);
+    if (parseMinor(match.amount) !== parseMinor(source.amount) || match.currency !== source.currency) {
+      addReview(operations, warnings, "SETTLED_CARD_REFERENCE_MISMATCH", sourceIdentity);
+      continue;
+    }
+    confirmedIds.add(match.id);
+    if (match.groupParentId !== null) {
+      addReview(operations, warnings, "SETTLED_CARD_PURCHASE_GROUPED", sourceIdentity);
+      continue;
+    }
+    const previousConfirmation = operations.find((operation) => operation.kind === "update-transaction" && operation.id === match.id);
+    if (previousConfirmation?.kind === "update-transaction" && previousConfirmation.patch.metadata) {
+      const aliases = previousConfirmation.patch.metadata.aliases;
+      previousConfirmation.patch.metadata.aliases = unique([...aliases, ...(match.metadata!.source_identity === sourceIdentity ? [] : [sourceIdentity])]);
+      continue;
+    }
+    operations.push({ kind: "update-transaction", id: match.id, sourceId: source.sourceId, patch: {
+      tagIds: lifecycleTags("settled", match.tagIds, ids),
+      metadata: { ...match.metadata!, lifecycle: "settled", last_seen_at: snapshot.capturedAt, miss_count: 0,
+        aliases: unique([...match.metadata!.aliases, ...(match.metadata!.source_identity === sourceIdentity ? [] : [sourceIdentity])]) },
+    } });
+  }
 
   for (let sourceIndex = 0; sourceIndex < snapshot.transactions.length; sourceIndex += 1) {
     const source = snapshot.transactions[sourceIndex]!;
-    if (unresolvedCardBookings.has(`${source.accountSourceId}\0${source.sourceId}`)) {
-      addReview(operations, warnings, "SETTLED_CARD_REFERENCE_UNRESOLVED", identity.digest("transaction", source.sourceId));
+    const booking = checkingBookings.get(`${source.accountSourceId}\0${source.sourceId}`);
+    if (booking) {
+      if (!booking.purchaseSourceId || !snapshot.transactions.some((candidate) => candidate.sourceId === booking.purchaseSourceId && isConfirmation(candidate))) {
+        addReview(operations, warnings, "SETTLED_CARD_REFERENCE_UNRESOLVED", identity.digest("transaction", source.sourceId));
+      }
       continue;
     }
+    if (isConfirmation(source)) continue;
     const accountId = sourceAccountToBudget.get(source.accountSourceId);
     if (!accountId) {
       addReview(operations, warnings, "ACCOUNT_MAPPING_MISSING", source.accountSourceId);
@@ -94,6 +144,8 @@ export function planTransactions(
     }
     const sourceIdentity = identity.digest("transaction", source.sourceId);
     const fingerprint = transactionFingerprint(source, identity);
+    if (managed.some((candidate) => confirmedIds.has(candidate.id) && candidate.accountId === accountId
+      && (candidate.metadata?.source_identity === sourceIdentity || candidate.metadata?.aliases.includes(sourceIdentity)))) continue;
     let match = managed.find((candidate) => !matchedIds.has(candidate.id) && candidate.accountId === accountId
       && (candidate.metadata?.source_identity === sourceIdentity || candidate.metadata?.aliases.includes(sourceIdentity)));
     if (!match && accountId === ids.checkingAccountId) {
@@ -145,7 +197,6 @@ export function planTransactions(
       });
     } else {
       matchedIds.add(match.id);
-      sourceIdToTransactionId.set(source.sourceId, match.id);
       if (match.groupParentId !== null) continue;
       const patch: Partial<DesiredTransaction> = { date: source.date, amount: source.amount, currency: source.currency, tagIds, externalId, metadata: nextMetadata };
       if (source.lifecycle === "pending" || source.lifecycle === "deferred") patch.payee = source.merchant;
@@ -172,7 +223,6 @@ export function planTransactions(
     }
   }
 
-  planSettlements(snapshot, sourceAccountToBudget, transactions, sourceIdToTransactionId, identity, ids, operations, warnings);
   planSyntheticDeletion(snapshot, transactions, operations, warnings);
   return { operations, warnings };
 }
@@ -240,81 +290,6 @@ function planSyntheticDeletion(
   if (!unresolved) operations.push({ kind: "delete-replaced-synthetic", id: synthetic[0]!.id });
 }
 
-function planSettlements(
-  snapshot: FortuneoSnapshot,
-  accountMap: ReadonlyMap<string, number>,
-  existing: readonly ExistingTransaction[],
-  sourceIdToTransactionId: ReadonlyMap<string, number>,
-  identity: IdentityService,
-  ids: ManagedIds,
-  operations: ReconciliationOperation[],
-  warnings: string[],
-): void {
-  for (const settlement of snapshot.settlements) {
-    if (settlement.purchaseSourceId) continue;
-    const checkingAmount = parseMinor(settlement.checkingDebit);
-    const creditTotal = settlement.cardCredits.reduce((sum, credit) => sum + parseMinor(credit.amount), 0n);
-    const exact = checkingAmount + creditTotal === 0n;
-    const checkingSourceId = settlement.sourceId;
-    const checkingExistingId = sourceIdToTransactionId.get(checkingSourceId);
-    if (!exact) {
-      categorizeCheckingSide(operations, checkingExistingId, checkingSourceId, ids.paymentTransferCategoryId);
-      addReview(operations, warnings, "SETTLEMENT_TOTAL_MISMATCH", identity.digest("settlement", settlement.sourceId));
-      continue;
-    }
-    const memberSourceIds = [checkingSourceId];
-    for (const credit of settlement.cardCredits) {
-      const accountId = accountMap.get(credit.cardAccountSourceId);
-      if (!accountId) {
-        addReview(operations, warnings, "SETTLEMENT_CARD_MAPPING_MISSING", credit.cardAccountSourceId);
-        continue;
-      }
-      const creditSourceId = `${settlement.sourceId}\0${credit.cardAccountSourceId}`;
-      memberSourceIds.push(creditSourceId);
-      const sourceIdentity = identity.digest("transaction", creditSourceId);
-      const externalId = `lmft:v2:${sourceIdentity}`;
-      const old = existing.find((candidate) => candidate.externalId === externalId);
-      if (!old) {
-        operations.push({
-          kind: "create-transaction",
-          sourceId: creditSourceId,
-          transaction: {
-            accountId,
-            date: settlement.date,
-            amount: credit.amount,
-            currency: settlement.currency,
-            payee: "Fortuneo card payment",
-            categoryId: ids.paymentTransferCategoryId,
-            tagIds: [],
-            externalId,
-            metadata: metadata(sourceIdentity, "settlement", identity.digest("payload", settlement.date, credit.amount, credit.cardAccountSourceId), snapshot.capturedAt),
-          },
-        });
-      }
-    }
-    categorizeCheckingSide(operations, checkingExistingId, checkingSourceId, ids.paymentTransferCategoryId);
-    operations.push({ kind: "group-settlement", sourceId: settlement.sourceId, date: settlement.date, memberSourceIds, categoryId: ids.paymentTransferCategoryId });
-  }
-}
-
-function categorizeCheckingSide(operations: ReconciliationOperation[], existingId: number | undefined, sourceId: string, categoryId: number): void {
-  if (existingId !== undefined) {
-    const update = operations.find((operation) => operation.kind === "update-transaction" && operation.id === existingId);
-    if (update?.kind === "update-transaction") {
-      update.patch.categoryId = categoryId;
-      delete update.categorySource;
-      return;
-    }
-    operations.push({ kind: "update-transaction", id: existingId, sourceId, patch: { categoryId } });
-    return;
-  }
-  const create = operations.find((operation) => operation.kind === "create-transaction" && operation.sourceId === sourceId);
-  if (create?.kind === "create-transaction") {
-    create.transaction.categoryId = categoryId;
-    delete create.categorySource;
-  }
-}
-
 function inferHistoricalCategory(merchant: string, accountId: number, existing: readonly ExistingTransaction[]): number | undefined {
   const normalizedMerchant = normalizeMerchant(merchant);
   const matches = existing.filter((transaction) =>
@@ -335,7 +310,7 @@ function lifecycleTags(lifecycle: FortuneoTransactionSnapshot["lifecycle"], exis
   return unrelated;
 }
 
-function transactionFingerprint(source: FortuneoTransactionSnapshot, identity: IdentityService): string {
+export function transactionFingerprint(source: FortuneoTransactionSnapshot, identity: IdentityService): string {
   return identity.digest("payload", source.accountSourceId, source.date, source.amount, normalizeMerchant(source.merchant));
 }
 
@@ -376,8 +351,4 @@ function addReview(operations: ReconciliationOperation[], warnings: string[], co
 
 function reviewOnly(code: string, subject: string): ReconciliationPlan {
   return { operations: [{ kind: "review", code, subject }], warnings: [code] };
-}
-
-export function settlementBalances(checkingDebit: string): string {
-  return negateMoney(checkingDebit);
 }

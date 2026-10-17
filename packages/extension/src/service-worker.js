@@ -1109,8 +1109,12 @@ function formatUiWarnings(warnings, details) {
   const ambiguousCount = Array.isArray(details?.transactions) ? details.transactions.filter((transaction) => transaction?.issue === "Multiple Lunch Money matches").length : 0;
   return warnings.slice(0, 20).map((warning) => warning === "AMBIGUOUS_FINGERPRINT"
     ? `${ambiguousCount || "Some"} transaction${ambiguousCount === 1 ? " was" : "s were"} skipped because the extension found multiple matching Lunch Money records. No change was made to those rows.`
+    : warning === "SETTLED_CARD_REFERENCE_MISMATCH"
+      ? "A settlement differs from its original purchase. The purchase was left unchanged and needs review."
+    : warning === "SETTLED_CARD_PURCHASE_GROUPED"
+      ? "A settled purchase belongs to a group. It was left unchanged and needs review."
     : warning === "SETTLED_CARD_REFERENCE_UNRESOLVED"
-      ? "Some card bookings need review: Fortuneo no longer provides their details and their original purchase could not be identified uniquely. Those bookings were left unchanged."
+      ? "Some settled card purchases could not be matched uniquely. No replacement purchases or payment credits were created."
       : warning === "UNEXPECTED_ERROR" ? "An internal error stopped the sync. See diagnostics for the failing step."
         : formatLunchMoneyFailure(warning));
 }
@@ -1243,18 +1247,17 @@ function summaryLabel(summary, dryRun, diagnostics = null) {
   if (!summary) return "Sync ended without a summary";
   const prefix = dryRun ? "Review" : "Sync";
   const breakdown = summary.breakdown;
-  if (!breakdown) return `${prefix}: ${summary.created} created, ${summary.updated} updated, ${summary.deleted} removed, ${summary.grouped} grouped`;
+  if (!breakdown) return `${prefix}: ${summary.created} created, ${summary.updated} updated, ${summary.deleted} removed`;
   const accountChanges = dryRun
     ? `${breakdown.accountsCreated} to create, ${breakdown.accountsUpdated} to update`
     : `${breakdown.accountsCreated} created, ${breakdown.accountsUpdated} updated`;
   const transactionChanges = dryRun
     ? `${breakdown.transactionsCreated} to create, ${breakdown.transactionsUpdated} to update, ${breakdown.transactionsDeleted} to remove`
     : `${breakdown.transactionsCreated} created, ${breakdown.transactionsUpdated} updated, ${breakdown.transactionsDeleted} removed`;
-  const grouping = dryRun ? `${breakdown.settlementsGrouped} to group` : `${breakdown.settlementsGrouped} grouped`;
   const deferredDiagnostic = breakdown.fortuneoDeferred === 0 && diagnostics
     ? ` Deferred read: ${diagnostics.deferredDateCandidates} dates, ${diagnostics.deferredResponses} responses, ${diagnostics.deferredRows} rows; amount ${diagnostics.deferredRowsWithAmount}, label ${diagnostics.deferredRowsWithLabel}, date ${diagnostics.deferredRowsWithDate}; fields ${Array.isArray(diagnostics.deferredFields) ? diagnostics.deferredFields.join(",") : "unknown"}.`
     : "";
-  return `${prefix}: accounts ${accountChanges}; transactions ${transactionChanges}; settlements ${grouping}. Fortuneo detected ${breakdown.fortuneoSettled} settled, ${breakdown.fortuneoDeferred} deferred, ${breakdown.fortuneoPending} pending.${deferredDiagnostic}`;
+  return `${prefix}: accounts ${accountChanges}; transactions ${transactionChanges}. Fortuneo detected ${breakdown.fortuneoSettled} settled, ${breakdown.fortuneoDeferred} deferred, ${breakdown.fortuneoPending} pending.${deferredDiagnostic}`;
 }
 
 function phaseLabel(phase) {

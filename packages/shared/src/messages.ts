@@ -28,7 +28,6 @@ export interface ResultSummary {
   created: number;
   updated: number;
   deleted: number;
-  grouped: number;
   warnings: string[];
   unresolvedCardReviewKeys?: string[];
   message: string;
@@ -38,7 +37,6 @@ export interface ResultSummary {
     transactionsCreated: number;
     transactionsUpdated: number;
     transactionsDeleted: number;
-    settlementsGrouped: number;
     fortuneoSettled: number;
     fortuneoDeferred: number;
     fortuneoPending: number;

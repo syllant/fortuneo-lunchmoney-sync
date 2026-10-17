@@ -18,7 +18,7 @@ The legacy `Fortuneo deferred cards` synthetic transaction is deleted only on a 
 
 ## Retirement after three successes
 
-Count a success only when the local result is successful, balances and settlement groups are manually verified, and no ambiguous review item remains. After three such live runs:
+Count a success only when the local result is successful, balances and separate transfer entries are manually verified, and no ambiguous review item remains. After three such live runs:
 
 1. Keep commit `30dddc8` and the relevant exports as the rollback checkpoint.
 2. Delete the `api` Worker, Workflow, D1 database, and integration-specific Cloudflare secrets using the reviewed Cloudflare runbook/dashboard.
