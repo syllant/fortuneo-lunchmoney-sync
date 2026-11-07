@@ -142,7 +142,7 @@ describe("Fortuneo tab cleanup", () => {
     };
     const context = {
       activeSync: sync, sync, clearFortuneoWait: vi.fn(), fortuneoDetectionSummary: vi.fn(),
-      setUi: vi.fn(), stopFortuneoCapture, traceAuth: vi.fn(),
+      setUi: vi.fn(), stopFortuneoCapture, traceAuth: vi.fn(), SYNC_IDLE_TIMEOUT_MS: 60_000,
       setTimeout: (callback: () => void) => { timeout = callback; return 1; },
     };
 
@@ -150,6 +150,97 @@ describe("Fortuneo tab cleanup", () => {
     timeout();
 
     expect(stopFortuneoCapture).toHaveBeenCalledWith(sync, true);
+  });
+});
+
+describe("Fortuneo collection progress", () => {
+  const progressSource = source.slice(source.indexOf("async function handleFortuneoReadProgress("), source.indexOf("async function syncIfDue("));
+  const sender = { tab: { id: 42 }, url: "https://mabanque.fortuneo.fr/mon-espace" };
+  const message = { step: "details", collectionId: "collection-1", completedDetails: 1 };
+  const makeSync = () => ({ collecting: true, fortuneoTabId: 42, progressStep: "fortuneo", fortuneoReadStep: "details", collectionId: "collection-1", completedDetails: 0 });
+
+  it("extends the idle deadline only when another detail finishes", async () => {
+    const sync = makeSync();
+    const refreshSyncTimeout = vi.fn();
+    const context = { activeSync: sync, message, sender, refreshSyncTimeout, traceAuth: vi.fn(), setUi: vi.fn(), fortuneoReadLabel: () => "Reading card details" };
+    const result = await runInNewContext(`${progressSource}\nhandleFortuneoReadProgress(message, sender)`, context);
+    expect(result).toEqual({ ok: true });
+    expect(sync.completedDetails).toBe(1);
+    expect(context.setUi).toHaveBeenCalledWith("running", "[3/4] Reading card details (1)…", []);
+    await runInNewContext(`${progressSource}\nhandleFortuneoReadProgress(message, sender)`, context);
+    expect(refreshSyncTimeout).toHaveBeenCalledOnce();
+  });
+
+  it("allows a detail read longer than a minute while progress continues, then stops a stalled read", async () => {
+    vi.useFakeTimers();
+    try {
+      const sync = { ...makeSync(), deadlineAt: Date.now() + 60_000, waitTimer: null, port: { disconnect: vi.fn() } };
+      const refreshSource = source.slice(source.indexOf("function refreshSyncTimeout("), source.indexOf("function fortuneoProgressLabel("));
+      const context = { activeSync: sync, sync, message: { ...message }, sender, Date, setTimeout, clearTimeout,
+        SYNC_IDLE_TIMEOUT_MS: 60_000, setUi: vi.fn(), traceAuth: vi.fn(), fortuneoReadLabel: () => "Reading card details",
+        clearFortuneoWait: vi.fn(), stopFortuneoCapture: vi.fn(), fortuneoDetectionSummary: () => "details",
+      };
+      await runInNewContext(`${progressSource}\n${syncTimeoutSource}\n${refreshSource}\nscheduleSyncTimeout(sync)`, context);
+      for (let count = 1; count <= 3; count += 1) {
+        await vi.advanceTimersByTimeAsync(40_000);
+        context.message.completedDetails = count;
+        await runInNewContext("handleFortuneoReadProgress(message, sender)", context);
+      }
+      expect(context.activeSync).toBe(sync);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(context.activeSync).toBeNull();
+      expect(sync.port.disconnect).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])("ignores a late collection response after the sync ended; replacement=%s", async (replace) => {
+    const readSource = source.slice(source.indexOf("async function readAndForwardSnapshot("), source.indexOf("function advanceFortuneoAccount("));
+    const sync = { requestId: "sync-1", collecting: false };
+    const replacement = { requestId: "sync-2", collecting: false };
+    const context = {
+      activeSync: sync as typeof sync | null,
+      getOrCreateFortuneoTab: async () => ({ tab: { id: 42, url: "account" }, created: false }),
+      waitForFortuneoTabReady: vi.fn(), chrome: { tabs: { get: async () => ({ url: "account", status: "complete" }) } },
+      isFortuneoAccountUrl: () => true, fortuneoAccountIdentity: () => null, clearAuthFallback: vi.fn(),
+      fortuneoPageKind: () => "account", traceAuth: vi.fn(), setUi: vi.fn(),
+      crypto: { randomUUID: () => "collection-1" }, FORTUNEO_COLLECT_MESSAGE: "collect",
+      sendFortuneoMessage: async () => { context.activeSync = replace ? replacement : null; return { ok: true, payloads: [] }; },
+    };
+    await runInNewContext(`${readSource}\nreadAndForwardSnapshot("sync-1")`, context);
+    expect(context.activeSync).toBe(replace ? replacement : null);
+    expect(context.traceAuth.mock.calls.some((call) => call[1] === "collection-response")).toBe(false);
+  });
+
+  it.each([
+    { message: { ...message, collectionId: "old-collection" }, sender },
+    { message, sender: { ...sender, tab: { id: 43 } } },
+    { message: { ...message, completedDetails: -1 }, sender },
+    { message: { ...message, completedDetails: 0.5 }, sender },
+  ])("ignores stale or invalid progress %#", async ({ message, sender }) => {
+    const refreshSyncTimeout = vi.fn();
+    const result = await runInNewContext(`${progressSource}\nhandleFortuneoReadProgress(message, sender)`, { activeSync: makeSync(), message, sender, refreshSyncTimeout });
+    expect(result).toEqual({ ok: false });
+    expect(refreshSyncTimeout).not.toHaveBeenCalled();
+  });
+
+  it("reports a delayed timeout and the actual last collection step", () => {
+    let timeout = () => {};
+    const sync = { deadlineAt: Date.now() - 3_600_000, waitTimer: null, port: { disconnect: vi.fn() }, fortuneoReadStep: "details", completedDetails: 12 };
+    const summarySource = source.slice(source.indexOf("function fortuneoDetectionSummary("), source.indexOf("function clearFortuneoWait("));
+    const setUi = vi.fn();
+    const traceAuth = vi.fn();
+    runInNewContext(`${summarySource}\n${syncTimeoutSource}\nscheduleSyncTimeout(sync)`, {
+      activeSync: sync, sync, setUi, traceAuth, SYNC_IDLE_TIMEOUT_MS: 60_000,
+      clearFortuneoWait: vi.fn(), stopFortuneoCapture: vi.fn(),
+      setTimeout: (callback: () => void) => { timeout = callback; return 1; },
+    });
+    timeout();
+    expect(setUi.mock.calls[0]?.[1]).toContain("may have been suspended");
+    expect(setUi.mock.calls[0]?.[1]).toContain("card details processed: 12");
+    expect(setUi.mock.calls[0]?.[1]).not.toContain("Pages seen: none");
+    expect(traceAuth).toHaveBeenCalledWith(sync, "sync-timeout", expect.objectContaining({ timerDelayMs: expect.any(Number) }));
   });
 });
 
@@ -293,7 +384,7 @@ describe("Fortuneo welcome page", () => {
     let buttons: ReturnType<typeof button>[] = [];
     const notify = vi.fn();
     const clear = vi.fn();
-    runInNewContext(`let welcomeSelected = false; let welcomeWatcher = null; ${welcomeSource}\nwatchWelcomePage()`, {
+    runInNewContext(`let welcomeSelected = false; let welcomeWatcher = null; let welcomeDeadline = 0; ${welcomeSource}\nwatchWelcomePage()`, {
       location: { origin: "https://mabanque.fortuneo.fr" }, document: { querySelectorAll: () => buttons },
       setInterval: (callback: () => void) => { tick = callback; return 1; }, clearInterval: clear,
       accountIdFromUrl: () => account, notifyIfAuthenticated: notify,
@@ -539,5 +630,387 @@ describe("unresolved card review notifications", () => {
   it("remembers only current opaque identities, allowing resolved items to expire", () => {
     expect(notify([changed], [key]).keys).toEqual([changed]);
     expect(notify([], [key]).keys).toEqual([]);
+  });
+});
+
+describe("Fortuneo SMS code challenge", () => {
+  const challengeSource = source.slice(source.indexOf("function challengeKindForStatus("));
+  const diagnose = (body: string, elements: Record<string, unknown> = {}) => runInNewContext(`${authDiagnosticsSource}\nauthenticationDiagnostics().error`, {
+    document: { body: { innerText: body }, querySelector: (selector: string) => Object.entries(elements).find(([key]) => selector.includes(key))?.[1] ?? null },
+    accountIdFromUrl: () => null, location: { pathname: "/mon-espace", hash: "" },
+    HTMLInputElement: class {},
+  });
+
+  it("recognizes the SMS code page but not SMS help text beside the login form", () => {
+    class Input {}
+    const context = (body: string, elements: Record<string, unknown>) => runInNewContext(`${authDiagnosticsSource}\nauthenticationDiagnostics().error`, {
+      document: { body: { innerText: body }, querySelector: (selector: string) => Object.entries(elements).find(([key]) => selector.includes(key))?.[1] ?? null },
+      accountIdFromUrl: () => null, location: { pathname: "/mon-espace", hash: "" }, HTMLInputElement: Input,
+    });
+    expect(diagnose("Saisissez le code reçu par SMS au 06 ** ** ** 12", { 'inputmode="numeric"': {} })).toBe("sms-code");
+    expect(diagnose("Vérification", { 'autocomplete="one-time-code"': {} })).toBe("sms-code");
+    expect(context("Recevez un code par SMS en cas d'oubli", { PASSWD: new Input(), 'inputmode="numeric"': {} })).toBe("none");
+  });
+
+  it("pauses automatic syncs for the rest of the day once a code was requested", async () => {
+    const startSync = vi.fn().mockResolvedValue(true);
+    const run = (fortuneoChallengeLocalDate: string | null) => runInNewContext(`${dueSource}\nsyncIfDue()`, {
+      chrome: { runtime: { getManifest: () => ({ version: "v" }) }, storage: { local: { get: vi.fn().mockResolvedValue({
+        lastSuccessfulLocalDate: null, lastSyncAttemptAt: null, setupPreviewConfirmed: true, fortuneoChallengeLocalDate,
+      }) } } },
+      DEFAULT_SETTINGS: {}, SYNC_RETRY_COOLDOWN_MS: 15 * 60_000,
+      localDate: () => "2026-11-07", activeSync: null, syncStartPending: false, startSync,
+    });
+    expect(await run("2026-11-07")).toBe(false);
+    expect(startSync).not.toHaveBeenCalled();
+    await run("2026-11-06");
+    expect(startSync).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the code tab, extends the wait, shows a notification and records the pause", async () => {
+    const sync = { waitingForFortuneo: false, waitingForAuthentication: false, fortuneoTabCreated: true, challenge: null as string | null, idleTimeoutMs: null as number | null };
+    const localSet = vi.fn();
+    const create = vi.fn();
+    const context = {
+      sync, activeSync: sync, FORTUNEO_CHALLENGE_KINDS: ["sms-code", "security-challenge"], FORTUNEO_CHALLENGE_TIMEOUT_MS: 300_000,
+      FORTUNEO_CHALLENGE_NOTIFICATION: "challenge", localDate: () => "2026-11-07",
+      clearAuthFallback: vi.fn(), traceAuth: vi.fn(), refreshSyncTimeout: vi.fn(), setUi: vi.fn(),
+      authenticationStatusMessage: () => "Enter the code Fortuneo sent by SMS; sync will resume automatically.",
+      OffscreenCanvas: undefined, setInterval: vi.fn(() => 9), clearInterval: vi.fn(), inspectFortuneoAuthentication: vi.fn(),
+      chrome: {
+        storage: { local: { set: localSet }, session: { set: vi.fn() } },
+        tabs: { update: vi.fn().mockResolvedValue({}) },
+        notifications: { clear: vi.fn(), create },
+      },
+    };
+    await runInNewContext(`${challengeSource}\nhandleFortuneoChallenge(sync, { id: 7 }, "sms-code")`, context);
+    await runInNewContext(`handleFortuneoChallenge(sync, { id: 7 }, "sms-code")`, context);
+    expect(sync).toMatchObject({ challenge: "sms-code", challengeSeen: true, challengeCount: 1, autoAuthAttempted: true, idleTimeoutMs: 300_000, fortuneoTabCreated: false, waitingForAuthentication: true });
+    expect(localSet).toHaveBeenCalledOnce();
+    expect(localSet).toHaveBeenCalledWith({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: "sms-code" });
+    expect(context.chrome.tabs.update).toHaveBeenCalledWith(7, { active: true });
+    expect(context.setUi).toHaveBeenCalledWith("needs-auth", "Enter the code Fortuneo sent by SMS; sync will resume automatically.", []);
+    // The icon cannot be drawn in this test context; the notification is best-effort.
+    expect(context.refreshSyncTimeout).toHaveBeenCalledWith(sync);
+  });
+
+  it("reports the SMS prompt from the post-sign-in check instead of waiting for the fallback", async () => {
+    const callbacks: Array<() => Promise<void>> = [];
+    const sync = { accountTargetIndex: 0, autoAuthAttempted: false, waitingForFortuneo: true, waitingForAuthentication: false };
+    const handleFortuneoChallenge = vi.fn();
+    const promptForFortuneoAuthentication = vi.fn();
+    const status = { error: "none" };
+    const context = {
+      sync, tab: { id: 1 }, activeSync: sync, Date, crypto: { randomUUID: () => "id" },
+      nativeOneShot: vi.fn().mockResolvedValue({ type: "fortuneo-credentials", available: true, accessCode: "user", password: "password" }),
+      submitFortuneoCredentials: vi.fn().mockResolvedValue(true),
+      setUi: vi.fn(), traceAuth: vi.fn(), clearAuthFallback: vi.fn(),
+      inspectFortuneoAuthentication: vi.fn(async () => status),
+      challengeKindForStatus: (value: { error: string }) => ["sms-code", "security-challenge"].includes(value.error) ? value.error : null,
+      authenticationIsPending: () => true, authenticationStatusMessage: vi.fn(), promptForFortuneoAuthentication, handleFortuneoChallenge,
+      setTimeout: (callback: () => Promise<void>) => { callbacks.push(callback); return callbacks.length; },
+    };
+    await runInNewContext(`${authenticateSource}\nauthenticateFortuneoOrPrompt(sync, tab, true)`, context);
+    await callbacks[0]!();
+    expect(callbacks).toHaveLength(2);
+    status.error = "sms-code";
+    await callbacks[1]!();
+    expect(handleFortuneoChallenge).toHaveBeenCalledWith(sync, { id: 1 }, "sms-code");
+    expect(promptForFortuneoAuthentication).not.toHaveBeenCalled();
+    expect(callbacks).toHaveLength(2);
+  });
+
+  it("leaves the code tab open on timeout and explains that automatic syncs are paused", () => {
+    let timeout = () => {};
+    const stopFortuneoCapture = vi.fn();
+    const setUi = vi.fn();
+    const sync = {
+      authIssue: null, authTrace: [], challenge: "sms-code", confirmedSnapshot: null, deadlineAt: Date.now() + 300_000,
+      dryRun: false, port: { disconnect: vi.fn() }, progressStep: "connection", waitTimer: null, waitingForAuthentication: true,
+    };
+    runInNewContext(`${syncTimeoutSource}\nscheduleSyncTimeout(sync)`, {
+      activeSync: sync, sync, clearFortuneoWait: vi.fn(), fortuneoDetectionSummary: vi.fn(),
+      setUi, stopFortuneoCapture, traceAuth: vi.fn(), SYNC_IDLE_TIMEOUT_MS: 60_000,
+      setTimeout: (callback: () => void) => { timeout = callback; return 1; },
+    });
+    timeout();
+    expect(setUi.mock.calls[0]?.[1]).toContain("SMS code was not entered");
+    expect(setUi.mock.calls[0]?.[1]).toContain("paused until tomorrow");
+  });
+
+  it("does not sign in again for the next account once a code was requested", () => {
+    const sync = {
+      accountTargetIndex: 0, accountTargets: ["first", "second"], requestedFortuneoUrl: "first", requestedFortuneoTabId: 1,
+      payloads: [], collecting: true, autoAuthAttempted: true, challengeSeen: true, waitingForFortuneo: false,
+    };
+    runInNewContext(`${advanceAccountSource}\nadvanceFortuneoAccount(sync)`, { sync, clearAuthFallback: vi.fn() });
+    expect(sync.autoAuthAttempted).toBe(true);
+  });
+
+  it("resumes in the tab where the code was entered, without signing in again", async () => {
+    const startSync = vi.fn().mockResolvedValue(true);
+    const localSet = vi.fn();
+    const run = (stored: Record<string, unknown>) => runInNewContext(`${challengeSource}\nresumeAfterFortuneoChallenge(42)`, {
+      activeSync: null, syncStartPending: false, startSync, DEFAULT_SETTINGS: {}, localDate: () => "2026-11-07",
+      FORTUNEO_CHALLENGE_NOTIFICATION: "challenge",
+      chrome: { storage: { local: { get: vi.fn().mockResolvedValue({ setupPreviewConfirmed: true, lastSuccessfulLocalDate: null, ...stored }), set: localSet }, session: { remove: vi.fn() } } },
+    });
+    expect(await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: null })).toBe(false);
+    await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: "sms-code" });
+    expect(startSync).toHaveBeenCalledWith("sync-if-due", null, { fortuneoTabId: 42, afterChallenge: true });
+    // The daily pause stays until a sync succeeds.
+    expect(localSet).toHaveBeenCalledWith({ fortuneoChallengeKind: null });
+  });
+
+  it("retries a refused read after the code instead of returning to the login form", async () => {
+    vi.useFakeTimers();
+    try {
+      const readSource = source.slice(source.indexOf("async function readAndForwardSnapshot("), source.indexOf("function advanceFortuneoAccount("));
+      const sync = { requestId: "sync-1", collecting: false, challengeSeen: true, settledAfterChallenge: true, observedPages: new Set(), resourceCandidates: 0, payloads: [] as unknown[] };
+      const update = vi.fn();
+      const context = {
+        activeSync: sync, Date, setTimeout,
+        getOrCreateFortuneoTab: async () => ({ tab: { id: 42, url: "account" }, created: false }),
+        waitForFortuneoTabReady: vi.fn(), chrome: { tabs: { get: async () => ({ url: "account", status: "complete" }), update } },
+        isFortuneoAccountUrl: () => true, fortuneoAccountIdentity: () => null, clearAuthFallback: vi.fn(),
+        fortuneoPageKind: () => "account", traceAuth: vi.fn(), setUi: vi.fn(),
+        crypto: { randomUUID: () => "collection-1" }, FORTUNEO_COLLECT_MESSAGE: "collect", FORTUNEO_COLLECTOR_VERSION: 17,
+        sendFortuneoMessage: async () => ({ ok: false, error: "FORTUNEO_SESSION_EXPIRED", collectorVersion: 17 }),
+        collectAndForwardSnapshot: vi.fn(),
+      };
+      const pending = runInNewContext(`${readSource}\nreadAndForwardSnapshot("sync-1")`, context);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await pending;
+      expect(update).not.toHaveBeenCalledWith(42, expect.objectContaining({ url: expect.any(String) }));
+      expect(context.collectAndForwardSnapshot).toHaveBeenCalledWith("sync-1");
+      expect(context.setUi).toHaveBeenCalledWith("running", "Waiting for Fortuneo to finish opening the session…", []);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps clicking through Fortuneo's welcome page long after the code was requested", () => {
+    vi.useFakeTimers();
+    try {
+      let account: string | null = null;
+      const next = { innerText: "Découvrir mon nouvel espace client", disabled: false, getAttribute: () => null, getClientRects: () => [{}], click: vi.fn() };
+      let buttons: unknown[] = [];
+      const context = {
+        location: { origin: "https://mabanque.fortuneo.fr" }, document: { querySelectorAll: () => buttons },
+        Date, setInterval, clearInterval, accountIdFromUrl: () => account, notifyIfAuthenticated: vi.fn(),
+      };
+      runInNewContext(`let welcomeSelected = false; let welcomeWatcher = null; let welcomeDeadline = 0; ${welcomeSource}\nwatchWelcomePage(600000)`, context);
+      vi.advanceTimersByTime(4 * 60_000);
+      buttons = [next];
+      vi.advanceTimersByTime(250);
+      expect(next.click).toHaveBeenCalledOnce();
+      account = "checking";
+      vi.advanceTimersByTime(250);
+      expect(context.notifyIfAuthenticated).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resumes the sync when the tab leaves the code page without a reload", async () => {
+    let tick: () => Promise<void> = async () => {};
+    const sync = { requestId: "sync-1", challenge: "sms-code", challengeWatch: null };
+    let status = { page: "challenge", error: "sms-code" };
+    const context = {
+      sync, activeSync: sync, FORTUNEO_CHALLENGE_KINDS: ["sms-code", "security-challenge"],
+      inspectFortuneoAuthentication: vi.fn(async () => status), traceAuth: vi.fn(), collectAndForwardSnapshot: vi.fn(),
+      setInterval: (callback: () => Promise<void>) => { tick = callback; return 5; }, clearInterval: vi.fn(),
+    };
+    runInNewContext(`${challengeSource}\nwatchFortuneoChallenge(sync, 7)`, context);
+    await tick();
+    expect(context.collectAndForwardSnapshot).not.toHaveBeenCalled();
+    status = { page: "login", error: "none" };
+    await tick();
+    expect(context.collectAndForwardSnapshot).toHaveBeenCalledWith("sync-1");
+    expect(context.clearInterval).toHaveBeenCalledWith(5);
+  });
+
+  it("never fills the sign-in form again after a code", async () => {
+    const sync: Record<string, unknown> = { waitingForFortuneo: true, waitingForAuthentication: true, fortuneoTabCreated: false, challenge: null, autoAuthAttempted: true };
+    const context = {
+      sync, activeSync: sync, FORTUNEO_CHALLENGE_KINDS: ["sms-code"], FORTUNEO_CHALLENGE_TIMEOUT_MS: 300_000,
+      FORTUNEO_CHALLENGE_NOTIFICATION: "challenge", localDate: () => "2026-11-07",
+      clearAuthFallback: vi.fn(), traceAuth: vi.fn(), refreshSyncTimeout: vi.fn(), setUi: vi.fn(), authenticationStatusMessage: () => "code",
+      setInterval: vi.fn(() => 1), clearInterval: vi.fn(), inspectFortuneoAuthentication: vi.fn(),
+      chrome: { storage: { local: { set: vi.fn() }, session: { set: vi.fn() } }, tabs: { update: vi.fn().mockResolvedValue({}) } },
+    };
+    sync.autoAuthAttempted = false;
+    await runInNewContext(`${challengeSource}\nhandleFortuneoChallenge(sync, { id: 7 }, "sms-code")`, context);
+    expect(sync.autoAuthAttempted).toBe(true);
+    sync.challenge = null;
+    await runInNewContext(`handleFortuneoChallenge(sync, { id: 7 }, "sms-code")`, context);
+    expect(sync).toMatchObject({ challengeCount: 2, autoAuthAttempted: true });
+  });
+
+  it("asks for a manual sign-in without filling it again once a code was used", async () => {
+    const promptForFortuneoAuthentication = vi.fn();
+    const sync = { autoAuthAttempted: true, challengeSeen: true };
+    await runInNewContext(`${authenticateSource}\nauthenticateFortuneoOrPrompt(sync, tab, true)`, {
+      sync, tab: { id: 1 }, traceAuth: vi.fn(), promptForFortuneoAuthentication, nativeOneShot: vi.fn(),
+    });
+    expect(promptForFortuneoAuthentication.mock.calls[0]?.[2]).toContain("to avoid another SMS code");
+  });
+
+  it("records route shapes without account identifiers or query values", () => {
+    const shapeSource = source.slice(source.indexOf("function fortuneoPathShape("), source.indexOf("function fortuneoPageKind("));
+    const shape = (url: string) => runInNewContext(`${shapeSource}\nfortuneoPathShape(url)`, { url, URL });
+    expect(shape("https://mabanque.fortuneo.fr/mon-espace/banque/compte-courant/00012345678?accountingDate=2026-11-07&code=secret#x"))
+      .toBe("/mon-espace/banque/compte-courant/:id?accountingDate&code#");
+    expect(shape("https://mabanque.fortuneo.fr/mon-espace/banque/livret-a/FgffdW-ZbqpVGwqQxtkWpg/solde"))
+      .toBe("/mon-espace/banque/livret-a/:id/solde");
+    expect(shape("https://example.com/whatever")).toBe("external");
+  });
+
+  it("keeps one trace line per read step so earlier sign-in steps are not lost", () => {
+    const sync = { startedAt: Date.now(), authTrace: [] as Array<Record<string, unknown>> };
+    runInNewContext(`${traceSource}
+      traceAuth(sync, "tab-update", { page: "account" });
+      for (let count = 1; count <= 200; count += 1) traceAuth(sync, "fortuneo-read", { step: "details", completedDetails: count });`, { sync, Date, Math });
+    expect(sync.authTrace.map((entry) => entry.event)).toEqual(["tab-update", "fortuneo-read"]);
+    expect(sync.authTrace[1]).toMatchObject({ completedDetails: 200 });
+  });
+
+  it("recognizes a read cut short by the Fortuneo page navigating away", () => {
+    const code = runInNewContext(`${internalErrorSource}\nchromeErrorCode(new Error(message))`, {
+      message: "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received",
+      safeCode: () => "UNEXPECTED_ERROR",
+    });
+    expect(code).toBe("FORTUNEO_TAB_NAVIGATING");
+  });
+
+  it("lets the account page settle after a code before reading it", async () => {
+    vi.useFakeTimers();
+    try {
+      const readSource = source.slice(source.indexOf("async function readAndForwardSnapshot("), source.indexOf("function advanceFortuneoAccount("));
+      const sync = { requestId: "sync-1", collecting: false, challengeSeen: true, idleTimeoutMs: null, observedPages: new Set(), resourceCandidates: 0, payloads: [] };
+      const url = "https://mabanque.fortuneo.fr/mon-espace/banque/compte-courant/1";
+      const events: string[] = [];
+      const context = {
+        activeSync: sync, Date, setTimeout, POST_CHALLENGE_SETTLE_MS: 4_000,
+        getOrCreateFortuneoTab: async () => ({ tab: { id: 42, url }, created: false }),
+        waitForFortuneoTabReady: vi.fn(), chrome: { tabs: { get: async () => ({ url, status: "complete" }) } },
+        isFortuneoAccountUrl: () => true, fortuneoAccountIdentity: () => null, clearAuthFallback: vi.fn(),
+        fortuneoPageKind: () => "account", fortuneoPathShape: () => "/path", setUi: vi.fn(),
+        traceAuth: (_sync: unknown, event: string) => { events.push(event); },
+        crypto: { randomUUID: () => "collection-1" }, FORTUNEO_COLLECT_MESSAGE: "collect",
+        sendFortuneoMessage: vi.fn(async () => { context.activeSync = null as never; return { ok: true, payloads: [] }; }),
+      };
+      const pending = runInNewContext(`${readSource}\nreadAndForwardSnapshot("sync-1")`, context);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(context.sendFortuneoMessage).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await pending;
+      expect(events.filter((event) => event.startsWith("post-challenge"))).toEqual(["post-challenge-settle", "post-challenge-settled"]);
+      expect(context.sendFortuneoMessage).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never reloads the Fortuneo tab after a code", async () => {
+    vi.useFakeTimers();
+    try {
+      const sendSource = source.slice(source.indexOf("async function sendFortuneoMessage("), source.indexOf("async function injectFortuneoContent("));
+      const reloadFortuneoTab = vi.fn();
+      const context = {
+        activeSync: { challengeSeen: true }, setTimeout, FORTUNEO_COLLECTOR_VERSION: 17, traceAuth: vi.fn(),
+        tryFortuneoMessage: vi.fn(async () => null), injectFortuneoContent: vi.fn(), reloadFortuneoTab,
+      };
+      const pending = runInNewContext(`${sendSource}\nsendFortuneoMessage(42, {})`, context);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await pending;
+      expect(reloadFortuneoTab).not.toHaveBeenCalled();
+      expect(context.injectFortuneoContent).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("follows Fortuneo to another page during a read and reads again instead of failing", async () => {
+    vi.useFakeTimers();
+    try {
+      const readSource = source.slice(source.indexOf("async function readAndForwardSnapshot("), source.indexOf("function advanceFortuneoAccount("));
+      const sync = { requestId: "sync-1", collecting: false, settledAfterChallenge: true, observedPages: new Set(), resourceCandidates: 0, payloads: [], port: { disconnect: vi.fn() } };
+      const events: Array<[string, Record<string, unknown>]> = [];
+      const context = {
+        activeSync: sync, Date, setTimeout, MAX_READ_INTERRUPTIONS: 2, FORTUNEO_COLLECTOR_VERSION: 17,
+        getOrCreateFortuneoTab: async () => ({ tab: { id: 42, url: "account" }, created: false }),
+        waitForFortuneoTabReady: vi.fn(), chrome: { tabs: { get: async () => ({ url: "welcome", status: "complete" }) } },
+        isFortuneoAccountUrl: (url: string) => url === "account", fortuneoAccountIdentity: () => null, clearAuthFallback: vi.fn(),
+        fortuneoPageKind: () => "fortuneo-other", fortuneoPathShape: () => "/welcome", setUi: vi.fn(),
+        traceAuth: (_sync: unknown, event: string, details: Record<string, unknown>) => { events.push([event, details]); },
+        crypto: { randomUUID: () => "collection-1" }, FORTUNEO_COLLECT_MESSAGE: "collect",
+        sendFortuneoMessage: async () => ({ ok: false, error: "FORTUNEO_TAB_NAVIGATING", collectorVersion: 17 }),
+        collectAndForwardSnapshot: vi.fn(), stopFortuneoCapture: vi.fn(), clearFortuneoWait: vi.fn(),
+      };
+      // The real tab.get returns the account page first, then the page Fortuneo moved to.
+      let first = true;
+      context.chrome.tabs.get = async () => {
+        if (first) { first = false; return { url: "account", status: "complete" }; }
+        return { url: "welcome", status: "complete" };
+      };
+      await runInNewContext(`${readSource}\nreadAndForwardSnapshot("sync-1")`, context);
+      expect(context.activeSync).toBe(sync);
+      expect(events.find(([event]) => event === "read-interrupted")?.[1]).toMatchObject({ attempt: 1, path: "/welcome" });
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(context.collectAndForwardSnapshot).toHaveBeenCalledWith("sync-1");
+      expect(sync.port.disconnect).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads the next account from the current page instead of loading its page", async () => {
+    const readSource = source.slice(source.indexOf("async function readAndForwardSnapshot("), source.indexOf("async function sendFortuneoMessage("));
+    const first = "https://mabanque.fortuneo.fr/mon-espace/banque/livret-a/saving/solde";
+    const second = "https://mabanque.fortuneo.fr/mon-espace/banque/courant/checking/carte/plafond";
+    const sync = {
+      requestId: "sync-1", collecting: false, settledAfterChallenge: true, observedPages: new Set(), resourceCandidates: 0, payloads: [],
+      snapshots: [], accountTargets: [first, second], accountTargetIndex: 0, requestedFortuneoUrl: first, requestedFortuneoTabId: 42,
+      port: { postMessage: vi.fn() },
+    };
+    const messages: Array<Record<string, unknown>> = [];
+    const update = vi.fn();
+    const context = {
+      activeSync: sync, FORTUNEO_COLLECTOR_VERSION: 18, FORTUNEO_COLLECT_MESSAGE: "collect", URL,
+      getOrCreateFortuneoTab: async () => ({ tab: { id: 42, url: first }, created: false }),
+      waitForFortuneoTabReady: vi.fn(), chrome: { tabs: { get: async () => ({ url: first, status: "complete" }), update } },
+      isFortuneoAccountUrl: (url: string) => typeof url === "string" && url.includes("/mon-espace/banque/"),
+      fortuneoAccountIdentity: (url: string) => url?.split("/")[6] ?? null, clearAuthFallback: vi.fn(),
+      fortuneoPageKind: () => "account", fortuneoPathShape: () => "/path", setUi: vi.fn(), traceAuth: vi.fn(),
+      crypto: { randomUUID: () => "collection" },
+      sendFortuneoMessage: async (_tab: number, message: Record<string, unknown>) => { messages.push(message); return { ok: true, payloads: [{ path: "/p", text: "{}" }], collectorVersion: 18 }; },
+      mergePayloads: (_existing: unknown, incoming: unknown) => incoming,
+      adaptFortuneo: () => ({ accounts: [], transactions: [], settlements: [], complete: true }),
+      rememberFortuneoAccountUrl: vi.fn(), combineFortuneoSnapshots: () => ({}),
+      collectAndForwardSnapshot: (requestId: string) => runInNewContext(`readAndForwardSnapshot(${JSON.stringify(requestId)})`, context),
+    };
+    await runInNewContext(`${readSource}\nreadAndForwardSnapshot("sync-1")`, context);
+    expect(update).not.toHaveBeenCalled();
+    expect(messages.map((message) => message.accountPath)).toEqual([new URL(first).pathname, new URL(second).pathname]);
+    expect(sync.port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "snapshot" }));
+  });
+
+  it("saves the running trace without waiting for a status change", async () => {
+    vi.useFakeTimers();
+    try {
+      const sync = { startedAt: Date.now(), authTrace: [] as unknown[], traceFlushTimer: null };
+      const set = vi.fn();
+      const context = {
+        sync, activeSync: sync, Date, Math, setTimeout,
+        chrome: { storage: { session: { get: async () => ({ uiState: { status: "running", message: "Reading" } }), set } } },
+      };
+      runInNewContext(`${traceSource}\ntraceAuth(sync, "tab-update", { page: "fortuneo-other" }); traceAuth(sync, "welcome-choice", {});`, context);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(set).toHaveBeenCalledOnce();
+      expect(set.mock.calls[0]?.[0].uiState.authTrace.map((entry: { event: string }) => entry.event)).toEqual(["tab-update", "welcome-choice"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

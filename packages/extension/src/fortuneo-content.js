@@ -1,17 +1,21 @@
 (() => {
 const MAX_TOTAL_BYTES = 900_000;
-const COLLECTOR_VERSION = 16;
-const AUTO_LOGIN_VERSION = 4;
+const SMS_CODE_WAIT_MS = 10 * 60_000;
+const COLLECTOR_VERSION = 18;
+const AUTO_LOGIN_VERSION = 5;
 const COLLECT_MESSAGE = `collect-snapshot-v${COLLECTOR_VERSION}`;
 const LOADED_KEY = `__fortuneoLunchMoneyContentLoadedV${COLLECTOR_VERSION}Auth${AUTO_LOGIN_VERSION}`;
 let welcomeWatcher = null;
+let welcomeDeadline = 0;
 let welcomeSelected = false;
+// Non-success API answers during the current read, by HTTP status (or "network"), for diagnostics.
+let apiIssues = {};
 
 if (!globalThis[LOADED_KEY]) {
   globalThis[LOADED_KEY] = true;
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === COLLECT_MESSAGE) {
-      void collectCurrentApi().then(
+      void collectCurrentApi(message.collectionId, message.accountPath).then(
         (response) => sendResponse({ ...response, collectorVersion: COLLECTOR_VERSION }),
         (error) => sendResponse({ ok: false, collectorVersion: COLLECTOR_VERSION, error: safeCode(error), diagnostic: collectionErrorDiagnostic(error) }),
       );
@@ -42,13 +46,18 @@ if (!globalThis[LOADED_KEY]) {
 function authenticationDiagnostics() {
   const body = document.body?.innerText ?? "";
   const normalized = body.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const password = document.querySelector('input[name="PASSWD"]');
+  const submit = document.querySelector('#valider_login[type="submit"]');
+  // A challenge replaces the login form; never treat help text on the login page as one.
+  const loginFormVisible = password instanceof HTMLInputElement;
+  const oneTimeCodeInput = document.querySelector('input[autocomplete="one-time-code"]');
+  const codeInput = oneTimeCodeInput ?? document.querySelector('input[inputmode="numeric"], input[type="tel"], input[name*="otp" i], input[id*="otp" i], input[name*="code" i], input[id*="code" i]');
   let error = "none";
   if (/identifiant ou le mot de passe ne correspondent|acces refuse|mot de passe incorrect/.test(normalized)) error = "invalid-credentials";
   else if (/acces est bloque|compte (?:est )?bloque/.test(normalized)) error = "account-blocked";
-  else if (/code de securite|authentification forte|confirmez|validation mobile|securipass/.test(normalized)) error = "security-challenge";
+  else if (!loginFormVisible && (oneTimeCodeInput || (/\bsms\b/.test(normalized) && /\bcode\b/.test(normalized) && codeInput))) error = "sms-code";
+  else if (!loginFormVisible && /code de securite|authentification forte|confirmez|validation mobile|securipass/.test(normalized)) error = "security-challenge";
   else if (/une erreur est survenue|erreur technique|service indisponible/.test(normalized)) error = "technical-error";
-  const password = document.querySelector('input[name="PASSWD"]');
-  const submit = document.querySelector('#valider_login[type="submit"]');
   const busy = Boolean(document.querySelector('[aria-busy="true"], [role="progressbar"]')) || (submit instanceof HTMLInputElement && submit.disabled);
   return {
     page: accountIdFromUrl() ? "account" : (/challenge|validation|secur/i.test(`${location.pathname}${location.hash}`) ? "challenge" : "login"),
@@ -59,12 +68,22 @@ function authenticationDiagnostics() {
 }
 
 async function prepareAutoLogin() {
-  if (location.origin !== "https://mabanque.fortuneo.fr" || /challenge|forgot|oubli|first[_-]?auth|password[_-]?reissue/i.test(`${location.pathname}${location.hash}`)) {
-    return { ok: false, error: "FORTUNEO_AUTO_LOGIN_UNAVAILABLE" };
+  // Never submit credentials again while Fortuneo waits for a code: that would send another SMS.
+  if (location.origin === "https://mabanque.fortuneo.fr" && authenticationDiagnostics().error === "sms-code") {
+    // Fortuneo shows its welcome page right after the code, often without reloading this document.
+    watchWelcomePage(SMS_CODE_WAIT_MS);
+    return { ok: false, error: "FORTUNEO_SECURITY_CHALLENGE", challenge: "sms-code" };
+  }
+  if (location.origin !== "https://mabanque.fortuneo.fr") return { ok: false, error: "FORTUNEO_AUTO_LOGIN_UNAVAILABLE" };
+  if (/challenge|forgot|oubli|first[_-]?auth|password[_-]?reissue/i.test(`${location.pathname}${location.hash}`)) {
+    // No sign-in here, but the "new customer space" choice may still be shown on such a route.
+    return await waitForWelcomeChoice() ? { ok: true, navigating: true } : { ok: false, error: "FORTUNEO_AUTO_LOGIN_UNAVAILABLE" };
   }
   watchWelcomePage();
   const fields = await waitForLoginForm();
   if (!fields) return { ok: false, error: "FORTUNEO_LOGIN_FORM_NOT_FOUND" };
+  if (fields.challenge) watchWelcomePage(SMS_CODE_WAIT_MS);
+  if (fields.challenge) return { ok: false, error: "FORTUNEO_SECURITY_CHALLENGE", challenge: fields.challenge };
   if (fields.navigating) return { ok: true, navigating: true };
   return { ok: true, ready: true };
 }
@@ -81,11 +100,11 @@ function selectNewCustomerSpace() {
   return true;
 }
 
-function watchWelcomePage() {
+function watchWelcomePage(durationMs = 60_000) {
+  welcomeDeadline = Math.max(welcomeDeadline, Date.now() + durationMs);
   if (welcomeWatcher) return;
-  const deadline = Date.now() + 60_000;
   welcomeWatcher = setInterval(() => {
-    if (Date.now() >= deadline || accountIdFromUrl()) {
+    if (Date.now() >= welcomeDeadline || accountIdFromUrl()) {
       clearInterval(welcomeWatcher);
       welcomeWatcher = null;
       if (accountIdFromUrl()) notifyIfAuthenticated();
@@ -95,10 +114,20 @@ function watchWelcomePage() {
   }, 250);
 }
 
+async function waitForWelcomeChoice() {
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    if (welcomeSelected || selectNewCustomerSpace()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
 async function waitForLoginForm() {
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
     if (welcomeSelected || selectNewCustomerSpace() || accountIdFromUrl()) return { navigating: true };
+    if (authenticationDiagnostics().error === "sms-code") return { challenge: "sms-code" };
     const passwordInputs = [...document.querySelectorAll('input[name="PASSWD"]')];
     if (passwordInputs.length === 1) {
       const passwordInput = passwordInputs[0];
@@ -114,17 +143,42 @@ async function waitForLoginForm() {
   return null;
 }
 
-async function collectCurrentApi() {
-  const accountId = accountIdFromUrl();
+async function collectCurrentApi(collectionId, accountPath) {
+  apiIssues = {};
+  let completedDetails = 0;
+  const progress = (step) => notifyCollectionProgress(step, collectionId, completedDetails);
+  const detailCompleted = () => { completedDetails += 1; progress("details"); };
+  // Read another account from this page through the API: loading its page right after an SMS code
+  // makes Fortuneo show its "new customer space" page and ask to sign in again.
+  const currentRoute = `${location.pathname}${location.hash}`;
+  const targetRoute = typeof accountPath === "string" && accountPath.length < 300 && !accountPath.includes("..")
+    && /^\/(?:mon-espace\/banque|account-summary)\//.test(accountPath) ? accountPath : null;
+  const route = targetRoute ?? currentRoute;
+  if (!accountIdFromUrl(currentRoute)) return { ok: false, error: "FORTUNEO_ACCOUNT_PAGE_REQUIRED" };
+  const accountId = accountIdFromUrl(route);
   if (!accountId) return { ok: false, error: "FORTUNEO_ACCOUNT_PAGE_REQUIRED" };
+  // Some time after a code sign-in Fortuneo can replace the account page with its "new customer space"
+  // choice; answer it as after a normal sign-in so the session and this read can continue.
+  welcomeSelected = false;
+  const readWelcomeWatcher = setInterval(() => {
+    if (selectNewCustomerSpace()) void chrome.runtime.sendMessage({ type: "fortuneo-page-event", event: "welcome-choice" }).catch(() => {});
+  }, 500);
+  try {
+    return await readAccountApi(accountId, route, currentRoute, progress, detailCompleted);
+  } finally {
+    clearInterval(readWelcomeWatcher);
+  }
+}
+
+async function readAccountApi(accountId, route, currentRoute, progress, detailCompleted) {
   const envResponse = await fetch("/env.json", { credentials: "same-origin", signal: AbortSignal.timeout(5_000) });
   if (!envResponse.ok) throw new Error("FORTUNEO_ENV_UNAVAILABLE");
   const env = await envResponse.json();
   if (typeof env.apigeeUrl !== "string" || typeof env.apigeeApiKey !== "string") throw new Error("FORTUNEO_ENV_INVALID");
 
   const request = (path, query) => fetchApi(env, path, query);
-  const accountKind = accountKindFromUrl();
-  notifyCollectionProgress("account");
+  const accountKind = accountKindFromUrl(route);
+  progress("account");
   const accountRequests = [
     request(`/account-api/v2/accounts/${encodeURIComponent(accountId)}`),
     request(`/account-api/v2/accounts/${encodeURIComponent(accountId)}/forecasted-balance`, { breakdown: "calendar,origin", forecastedAccountingTransactionBreakdown: "carte_dd" }),
@@ -136,20 +190,20 @@ async function collectCurrentApi() {
   const accountResults = Promise.allSettled(accountRequests);
   const transactionResults = Promise.allSettled(transactionRequests);
   const settledAccounts = await accountResults;
-  notifyCollectionProgress("transactions");
+  progress("transactions");
   const settledTransactions = await transactionResults;
   const settled = [...settledAccounts, ...settledTransactions];
   const payloads = settled.filter((result) => result.status === "fulfilled").map((result) => annotateAccountKind(result.value, accountKind));
   const failureCodes = settled.filter((result) => result.status === "rejected").map((result) => safeCode(result.reason));
   const forecast = payloads.find((payload) => payload.path.includes("/forecasted-balance"));
   const forecastData = forecast ? JSON.parse(forecast.text) : null;
-  const currentDate = new URL(location.href).searchParams.get("accountingDate");
+  const currentDate = accountIdFromUrl(currentRoute) === accountId ? new URL(location.href).searchParams.get("accountingDate") : null;
   const dates = accountKind === "savings" ? [] : [...new Set([
     ...(forecastData ? deferredAccountingDates(forecastData) : []),
     ...(currentDate && /^\d{4}-\d{2}-\d{2}$/.test(currentDate) ? [currentDate] : []),
     ...(forecastData ? allAccountingDates(forecastData) : []),
   ])].slice(0, 24);
-  notifyCollectionProgress("deferred");
+  progress("deferred");
   const deferred = await Promise.allSettled(dates.map((date) => request(`/account-api/v2/accounts/${encodeURIComponent(accountId)}/upcoming-transactions`, {
     family: "CARTE",
     dateFrom: `${date}T00:00:00.000Z`,
@@ -158,11 +212,11 @@ async function collectCurrentApi() {
   const successfulDeferred = deferred.filter((result) => result.status === "fulfilled");
   const deferredRows = successfulDeferred.flatMap((result) => responseArray(JSON.parse(result.value.text)));
   if (deferredRows.length > 0 || payloads.some((payload) => payload.path.includes("transactionType=CAV")
-    && responseArray(JSON.parse(payload.text)).some((row) => settledCardDetailPath(row)))) notifyCollectionProgress("details");
+    && responseArray(JSON.parse(payload.text)).some((row) => settledCardDetailPath(row)))) progress("details");
   const detailCache = new Map();
   for (let index = 0; index < payloads.length; index += 1) {
     if (!payloads[index].path.includes("transactionType=CAV")) continue;
-    const enrichment = await enrichTransactionPayload(env, payloads[index], settledCardDetailPath, detailCache, 1000);
+    const enrichment = await enrichTransactionPayload(env, payloads[index], settledCardDetailPath, detailCache, 1000, detailCompleted);
     if (enrichment.failed > 0 && (enrichment.requested > 1000 || enrichment.errorCodes.some((code) => code !== "FORTUNEO_API_HTTP_404"))) {
       throw new Error(`FORTUNEO_SETTLED_CARD_DETAILS_INCOMPLETE_${enrichment.errorCodes.find((code) => code !== "FORTUNEO_API_HTTP_404") ?? "LIMIT"}`);
     }
@@ -171,7 +225,7 @@ async function collectCurrentApi() {
   const detailDiagnostics = { requested: 0, enriched: 0, failed: 0 };
   for (const result of deferred) {
     if (result.status !== "fulfilled") continue;
-    const enrichment = await enrichTransactionPayload(env, result.value, deferredDetailPath, detailCache);
+    const enrichment = await enrichTransactionPayload(env, result.value, deferredDetailPath, detailCache, 100, detailCompleted);
     payloads.push(enrichment.payload);
     detailDiagnostics.requested += enrichment.requested;
     detailDiagnostics.enriched += enrichment.enriched;
@@ -195,8 +249,8 @@ async function collectCurrentApi() {
     : { ok: false, error: failureCodes.includes("FORTUNEO_SESSION_EXPIRED") ? "FORTUNEO_SESSION_EXPIRED" : "FORTUNEO_API_READ_FAILED" };
 }
 
-function accountKindFromUrl() {
-  return /\/mon-espace\/banque\/(?:livret|livret-a|ldds|lep|pel|cel|epargne)\//i.test(`${location.pathname}${location.hash}`) ? "savings" : "checking";
+function accountKindFromUrl(route = `${location.pathname}${location.hash}`) {
+  return /\/mon-espace\/banque\/(?:livret|livret-a|ldds|lep|pel|cel|epargne)\//i.test(route) ? "savings" : "checking";
 }
 
 function annotateAccountKind(payload, kind) {
@@ -206,8 +260,9 @@ function annotateAccountKind(payload, kind) {
   return { ...payload, text: JSON.stringify({ ...data, __fortuneoAccountKind: kind }) };
 }
 
-function notifyCollectionProgress(step) {
-  void chrome.runtime.sendMessage({ type: "fortuneo-read-progress", step }).catch(() => {});
+function notifyCollectionProgress(step, collectionId, completedDetails) {
+  const issues = Object.entries(apiIssues).map(([key, count]) => `${key}:${count}`).join(" ").slice(0, 80);
+  void chrome.runtime.sendMessage({ type: "fortuneo-read-progress", step, collectionId, completedDetails, apiIssues: issues }).catch(() => {});
 }
 
 async function fetchApi(env, path, query = {}) {
@@ -221,11 +276,13 @@ async function fetchApi(env, path, query = {}) {
         headers: { apikey: env.apigeeApiKey },
         signal: AbortSignal.timeout(8_000),
       });
+      if (!response.ok) apiIssues[response.status] = (apiIssues[response.status] ?? 0) + 1;
       if (response.status === 401 || response.status === 403) lastCode = "FORTUNEO_SESSION_EXPIRED";
       else if (response.ok && /json/i.test(response.headers.get("content-type") ?? "")) {
         return { path: `${url.pathname}${url.search}`, text: await response.text() };
       } else lastCode = response.ok ? "FORTUNEO_API_NON_JSON" : `FORTUNEO_API_HTTP_${response.status}`;
     } catch {
+      apiIssues.network = (apiIssues.network ?? 0) + 1;
       lastCode = "FORTUNEO_API_READ_FAILED";
     }
     if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
@@ -233,7 +290,7 @@ async function fetchApi(env, path, query = {}) {
   throw new Error(lastCode);
 }
 
-async function enrichTransactionPayload(env, payload, detailPathForRow, detailCache, limit = 100) {
+async function enrichTransactionPayload(env, payload, detailPathForRow, detailCache, limit = 100, onDetailCompleted = () => {}) {
   const data = JSON.parse(payload.text);
   const rows = responseArray(data);
   const output = [...rows];
@@ -257,6 +314,7 @@ async function enrichTransactionPayload(env, payload, detailPathForRow, detailCa
         errorCodes.add(detail?.error ?? "UNAVAILABLE");
         if (candidate.row && typeof candidate.row === "object" && !Array.isArray(candidate.row)) output[candidate.index] = { ...candidate.row, __fortuneoDetail: { error: detail?.error ?? "UNAVAILABLE" } };
       }
+      onDetailCompleted();
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, limited.length) }, () => worker()));
@@ -371,8 +429,7 @@ function hasDeferredDate(value) {
   return Boolean(value && typeof value === "object" && [value.accountingDate, value.transactionDate, value.expectedDate, value.date].some((item) => typeof item === "string"));
 }
 
-function accountIdFromUrl() {
-  const route = `${location.pathname}${location.hash}`;
+function accountIdFromUrl(route = `${location.pathname}${location.hash}`) {
   const match = route.match(/\/mon-espace\/banque\/[^/]+\/([^/?#]+)(?:\/|$)/i)
     ?? route.match(/\/account-summary\/([^/?#]+)(?:\/|$)/i);
   return match ? decodeURIComponent(match[1]) : null;

@@ -215,6 +215,24 @@ const enrichment = content.slice(content.indexOf("async function enrichTransacti
 const helpers = content.slice(content.indexOf("function deferredDetailPath("), content.indexOf("function accountIdFromUrl("));
 
 describe("settled card detail collection", () => {
+  it("reports each completed detail while a slower request is still pending", async () => {
+    let finishSlow: (value: unknown) => void = () => {};
+    const slow = new Promise((resolve) => { finishSlow = resolve; });
+    let signalFastFinished = () => {};
+    const fastFinished = new Promise<void>((resolve) => { signalFastFinished = resolve; });
+    const onDetailCompleted = vi.fn(() => signalFastFinished());
+    const fetchDetailApi = vi.fn((_: unknown, path: string) => path.includes("slow") ? slow : Promise.resolve({ text: JSON.stringify(detail("world", "fast")) }));
+    const result = runInNewContext(`${enrichment}\n${helpers}\nenrichTransactionPayload({}, payload, settledCardDetailPath, new Map(), 1000, onDetailCompleted)`, {
+      payload: { path: "history", text: JSON.stringify([booking("world", -25, "slow"), booking("world", -25, "fast")]) },
+      fetchDetailApi, onDetailCompleted,
+    });
+    await fastFinished;
+    expect(onDetailCompleted).toHaveBeenCalledOnce();
+    finishSlow({ text: JSON.stringify(detail("world", "slow")) });
+    expect(await result).toMatchObject({ requested: 2, enriched: 2, failed: 0 });
+    expect(onDetailCompleted).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["MERCHANT_MISSING", "FORTUNEO_API_HTTP_429", "FORTUNEO_API_HTTP_404"])("reports %s without treating missing details as a successful collection", async (code) => {
     const fetchDetailApi = code === "MERCHANT_MISSING"
       ? vi.fn().mockResolvedValue({ text: JSON.stringify({ card: { contractId: "world" } }) })

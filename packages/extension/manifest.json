@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Fortuneo → Lunch Money",
-  "version": "2.1.54",
+  "version": "2.1.65",
   "description": "Runs a local Fortuneo sync when Lunch Money is opened or its Overview page is visited.",
   "minimum_chrome_version": "120",
-  "permissions": ["storage", "nativeMessaging", "tabs", "scripting", "alarms"],
+  "permissions": ["storage", "nativeMessaging", "tabs", "scripting", "alarms", "notifications"],
   "host_permissions": [
     "https://my.lunchmoney.app/*",
     "https://beta.lunchmoney.app/*",

@@ -3,14 +3,20 @@ import { adaptFortuneo } from "./fortuneo-adapter.js";
 const NATIVE_HOST = "com.sylvaindurand.fortuneo_lunchmoney_sync";
 const FORTUNEO_LOGIN = "https://mabanque.fortuneo.fr/mon-espace";
 const FORTUNEO_TAB_URL = "https://mabanque.fortuneo.fr/*";
-const FORTUNEO_COLLECTOR_VERSION = 16;
+const FORTUNEO_COLLECTOR_VERSION = 18;
 const FORTUNEO_COLLECT_MESSAGE = `collect-snapshot-v${FORTUNEO_COLLECTOR_VERSION}`;
 const LUNCH_MONEY_URLS = ["https://my.lunchmoney.app/*", "https://beta.lunchmoney.app/*"];
 const DAILY_STATUS_ALARM = "refresh-daily-status";
 const SYNC_RETRY_ALARM = "retry-daily-sync";
 const SYNC_IDLE_TIMEOUT_MS = 60_000;
 const SYNC_RETRY_COOLDOWN_MS = 15 * 60_000;
-const DEFAULT_SETTINGS = { lastSuccessfulLocalDate: null, lastSuccessfulAt: null, lastSyncAttemptLocalDate: null, lastSyncAttemptAt: null, setupPreviewConfirmed: false, uiState: { status: "idle", message: "Ready", warnings: [] } };
+// Leave time to receive and type a Fortuneo SMS code before abandoning the sync.
+const FORTUNEO_CHALLENGE_TIMEOUT_MS = 5 * 60_000;
+const FORTUNEO_CHALLENGE_NOTIFICATION = "fortuneo-security-challenge";
+const FORTUNEO_CHALLENGE_KINDS = ["sms-code", "security-challenge"];
+const POST_CHALLENGE_SETTLE_MS = 4_000;
+const MAX_READ_INTERRUPTIONS = 2;
+const DEFAULT_SETTINGS = { lastSuccessfulLocalDate: null, fortuneoChallengeLocalDate: null, fortuneoChallengeKind: null, lastSuccessfulAt: null, lastSyncAttemptLocalDate: null, lastSyncAttemptAt: null, setupPreviewConfirmed: false, uiState: { status: "idle", message: "Ready", warnings: [] } };
 
 let activeSync = null;
 let syncStartPending = false;
@@ -33,13 +39,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const observedUrl = changeInfo.url ?? tab.url;
   if (changeInfo.status === "complete" && isLunchMoneyUrl(observedUrl)) void initialized.then(() => syncIfDue());
+  const reachedFortuneoAccount = isFortuneoAccountUrl(changeInfo.url ?? (changeInfo.status === "complete" ? tab.url : undefined));
+  if (reachedFortuneoAccount && !activeSync) void initialized.then(() => resumeAfterFortuneoChallenge(tabId));
+  if (activeSync && tabId === activeSync.fortuneoTabId) traceAuth(activeSync, "tab-update", { status: changeInfo.status ?? "url", page: fortuneoPageKind(changeInfo.url ?? tab.url), path: fortuneoPathShape(changeInfo.url ?? tab.url), ...(activeSync.collecting ? { during: "read" } : {}) });
   if (!activeSync?.waitingForFortuneo) return;
-  if (tabId === activeSync.fortuneoTabId) traceAuth(activeSync, "tab-update", { status: changeInfo.status ?? "url", page: fortuneoPageKind(changeInfo.url ?? tab.url) });
   if (tabId === activeSync.fortuneoTabId && changeInfo.status === "complete") void collectAndForwardSnapshot(activeSync.requestId);
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   void syncForLunchMoneyTab(tabId);
+});
+
+chrome.notifications?.onClicked.addListener((notificationId) => {
+  if (notificationId === FORTUNEO_CHALLENGE_NOTIFICATION) void showFortuneoChallengeTab();
 });
 
 async function syncForLunchMoneyTab(tabId) {
@@ -91,7 +103,7 @@ function isAllowedSender(type, sender) {
   if (isLunchMoneyUrl(sender.url)) return ["lunch-money-ready", "sync-if-due", "sync-now", "cancel-sync", "reconnect-fortuneo", "get-state"].includes(type);
   try {
     return new URL(sender.url).origin === "https://mabanque.fortuneo.fr"
-      && ["fortuneo-ready", "fortuneo-read-progress"].includes(type);
+      && ["fortuneo-ready", "fortuneo-read-progress", "fortuneo-page-event"].includes(type);
   } catch {
     return false;
   }
@@ -168,23 +180,40 @@ async function handleMessage(message, _sender) {
       if (typeof _sender.url === "string" && isFortuneoAccountUrl(_sender.url)) await rememberFortuneoAccountUrl(_sender.url);
       if (activeSync?.waitingForFortuneo) await collectAndForwardSnapshot(activeSync.requestId);
       return { ok: true };
-    case "fortuneo-read-progress": {
-      const step = ["account", "transactions", "deferred", "details"].includes(message.step) ? message.step : null;
-      const fromActiveFortuneoTab = activeSync && _sender.tab?.id === activeSync.fortuneoTabId && typeof _sender.url === "string" && _sender.url.startsWith("https://mabanque.fortuneo.fr/");
-      if (!step || !fromActiveFortuneoTab || activeSync.progressStep !== "fortuneo") return { ok: false };
-      activeSync.fortuneoReadStep = step;
-      refreshSyncTimeout(activeSync);
-      traceAuth(activeSync, "fortuneo-read", { step });
-      await setUi("running", `[3/4] ${fortuneoReadLabel(step)}…`, []);
+    case "fortuneo-page-event":
+      if (activeSync && _sender.tab?.id === activeSync.fortuneoTabId && ["welcome-choice"].includes(message.event)) {
+        traceAuth(activeSync, message.event, { path: fortuneoPathShape(_sender.url), ...(activeSync.collecting ? { during: "read" } : {}) });
+      }
       return { ok: true };
-    }
+    case "fortuneo-read-progress":
+      return handleFortuneoReadProgress(message, _sender);
     default:
       return { ok: false, error: "UNKNOWN_MESSAGE" };
   }
 }
 
+async function handleFortuneoReadProgress(message, sender) {
+  const sync = activeSync;
+  const step = ["account", "transactions", "deferred", "details"].includes(message.step) ? message.step : null;
+  if (!sync?.collecting || !step || sender.tab?.id !== sync.fortuneoTabId
+    || !sender.url?.startsWith("https://mabanque.fortuneo.fr/")
+    || sync.progressStep !== "fortuneo" || message.collectionId !== sync.collectionId) return { ok: false };
+  const completedDetails = message.completedDetails;
+  if (!Number.isSafeInteger(completedDetails) || completedDetails < (sync.completedDetails ?? 0)) return { ok: false };
+  if (step === sync.fortuneoReadStep && completedDetails === sync.completedDetails) return { ok: true };
+  sync.fortuneoReadStep = step;
+  sync.completedDetails = completedDetails;
+  if (typeof message.apiIssues === "string" && /^[a-z0-9: ]{0,80}$/.test(message.apiIssues)) sync.fortuneoApiIssues = message.apiIssues;
+  refreshSyncTimeout(sync);
+  traceAuth(sync, "fortuneo-read", { step, completedDetails, ...(sync.fortuneoApiIssues ? { apiIssues: sync.fortuneoApiIssues } : {}) });
+  await setUi("running", `[3/4] ${fortuneoReadLabel(step)}${step === "details" && completedDetails ? ` (${completedDetails})` : ""}…`, []);
+  return { ok: true };
+}
+
 async function syncIfDue() {
-  const { lastSuccessfulLocalDate, lastSyncAttemptAt, lastSyncAttemptVersion, setupPreviewConfirmed } = await chrome.storage.local.get({ ...DEFAULT_SETTINGS, lastSyncAttemptVersion: null });
+  const { lastSuccessfulLocalDate, lastSyncAttemptAt, lastSyncAttemptVersion, setupPreviewConfirmed, fortuneoChallengeLocalDate } = await chrome.storage.local.get({ ...DEFAULT_SETTINGS, lastSyncAttemptVersion: null });
+  // Each automatic attempt can make Fortuneo send another SMS: once a code was requested, wait until tomorrow.
+  if (fortuneoChallengeLocalDate && fortuneoChallengeLocalDate === localDate()) return false;
   const lastAttemptAge = Date.now() - Date.parse(lastSyncAttemptAt ?? "");
   const attemptedRecently = lastSyncAttemptVersion === chrome.runtime.getManifest().version
     && Number.isFinite(lastAttemptAge) && lastAttemptAge >= 0 && lastAttemptAge < SYNC_RETRY_COOLDOWN_MS;
@@ -192,7 +221,7 @@ async function syncIfDue() {
   return startSync("sync-if-due");
 }
 
-async function startSync(type, confirmedSnapshot = null) {
+async function startSync(type, confirmedSnapshot = null, options = {}) {
   if (activeSync || syncStartPending) return false;
   syncStartPending = true;
   let startupStage = "initializing";
@@ -221,8 +250,11 @@ async function startSync(type, confirmedSnapshot = null) {
       await reportNativeStartupFailure(type, startupStage, knownAccountsResponse);
       return false;
     }
-    const requestedFortuneoUrl = canonicalFortuneoAccountUrl(focusedTab?.url);
-    const requestedFortuneoTabId = requestedFortuneoUrl && focusedTab?.id !== undefined ? focusedTab.id : null;
+    // After an SMS code, read from the tab where it was entered: another tab may not share that session.
+    const sourceTab = Number.isSafeInteger(options.fortuneoTabId) ? await chrome.tabs.get(options.fortuneoTabId).catch(() => null) : focusedTab;
+    const requestedFortuneoUrl = canonicalFortuneoAccountUrl(sourceTab?.url);
+    const requestedFortuneoTabId = requestedFortuneoUrl && sourceTab?.id !== undefined ? sourceTab.id : null;
+    const afterChallenge = options.afterChallenge === true;
     const knownFortuneoAccountUrls = knownAccountsResponse?.type === "fortuneo-account-urls" ? knownAccountsResponse.urls : [];
     const accountTargets = uniqueFortuneoAccountUrls([requestedFortuneoUrl, ...knownFortuneoAccountUrls]);
     const requestId = crypto.randomUUID();
@@ -233,7 +265,7 @@ async function startSync(type, confirmedSnapshot = null) {
     const previewIsRecent = Number.isFinite(Date.parse(uiState?.updatedAt ?? "")) && startedAt - Date.parse(uiState.updatedAt) < 10 * 60_000;
     const retainedDetails = type === "sync" && uiState?.operation === "preview" && previewIsRecent ? uiState.details ?? uiState.preview ?? null : null;
     if (type === "dry-run") await chrome.storage.session.remove("confirmedPreviewSnapshot");
-    activeSync = { requestId, port, dryRun: type === "dry-run", confirmedSnapshot, snapshot: null, snapshots: [], waitingForFortuneo: false, waitingForAuthentication: false, autoAuthAttempted: false, authIssue: null, collecting: false, loginProbeId: null, payloads: [], observedPages: new Set(), resourceCandidates: 0, fortuneoDiagnostics: null, retainedDetails, startedAt, timeoutStartedAt: startedAt, deadlineAt: startedAt + SYNC_IDLE_TIMEOUT_MS, waitTimer: null, handshakeTimer: null, authFallbackTimer: null, fortuneoTabId: null, fortuneoTabCreated: false, requestedFortuneoUrl: accountTargets[0] ?? requestedFortuneoUrl, requestedFortuneoTabId, accountTargets, accountTargetIndex: 0, dedicatedFortuneoTab: accountTargets.length > 1 || (accountTargets.length === 1 && requestedFortuneoTabId === null), targetNavigationAttempted: false, progressStep: "setup", fortuneoReadStep: null, authTrace: [], nativeMessageQueue: Promise.resolve() };
+    activeSync = { requestId, port, dryRun: type === "dry-run", confirmedSnapshot, snapshot: null, snapshots: [], waitingForFortuneo: false, waitingForAuthentication: false, autoAuthAttempted: afterChallenge, challengeSeen: afterChallenge, authIssue: null, collecting: false, loginProbeId: null, payloads: [], observedPages: new Set(), resourceCandidates: 0, fortuneoDiagnostics: null, retainedDetails, startedAt, timeoutStartedAt: startedAt, deadlineAt: startedAt + SYNC_IDLE_TIMEOUT_MS, waitTimer: null, handshakeTimer: null, authFallbackTimer: null, fortuneoTabId: null, fortuneoTabCreated: false, requestedFortuneoUrl: accountTargets[0] ?? requestedFortuneoUrl, requestedFortuneoTabId, accountTargets, accountTargetIndex: 0, dedicatedFortuneoTab: !(afterChallenge && requestedFortuneoTabId !== null) && (accountTargets.length > 1 || (accountTargets.length === 1 && requestedFortuneoTabId === null)), targetNavigationAttempted: false, progressStep: "setup", fortuneoReadStep: null, authTrace: [], nativeMessageQueue: Promise.resolve() };
     startedSync = activeSync;
     traceAuth(activeSync, "sync-start", { operation: type });
     startupStage = "publishing-start-state";
@@ -386,7 +418,10 @@ async function handleNativeMessage(message) {
         : (completedWithWarnings ? `Sync complete with ${warningCount} warning${warningCount === 1 ? "" : "s"}.` : completedOk ? `${syncCompletionLabel(details)}${automaticRetryNote}` : syncFailureLabel(message.summary));
     if (message.dryRun && Boolean(details) && completed.snapshot) await chrome.storage.session.set({ confirmedPreviewSnapshot: completed.snapshot });
     else if (!message.dryRun || !message.ok) await chrome.storage.session.remove("confirmedPreviewSnapshot");
-    if (Boolean(details) && !message.dryRun) await chrome.storage.local.set({ ...(reviewNotification.keys ? { reportedCardReviewKeys: reviewNotification.keys } : {}), lastSuccessfulLocalDate: localDate(), lastSuccessfulAt: new Date().toISOString(), setupPreviewConfirmed: true });
+    if (Boolean(details) && !message.dryRun) {
+      await chrome.storage.local.set({ ...(reviewNotification.keys ? { reportedCardReviewKeys: reviewNotification.keys } : {}), lastSuccessfulLocalDate: localDate(), lastSuccessfulAt: new Date().toISOString(), setupPreviewConfirmed: true, fortuneoChallengeLocalDate: null, fortuneoChallengeKind: null });
+      await clearFortuneoChallengeNotification();
+    }
     await setUi(status, resultMessage, warnings, details, message.dryRun ? "preview" : "sync", completed.authTrace);
     const port = completed.port;
     port.disconnect();
@@ -408,7 +443,8 @@ async function readAndForwardSnapshot(requestId) {
   activeSync.collecting = true;
   const fortuneoTab = await getOrCreateFortuneoTab();
   const tab = fortuneoTab.tab;
-  if (fortuneoTab.created) activeSync.fortuneoTabCreated = true;
+  // Keep a tab showing a Fortuneo code prompt open, even when the sync is abandoned.
+  if (fortuneoTab.created && !activeSync.challengeSeen) activeSync.fortuneoTabCreated = true;
   activeSync.fortuneoTabId = tab.id ?? null;
   traceAuth(activeSync, "tab-selected", { page: fortuneoPageKind(tab.url) });
   if (tab.id === undefined) throw new Error("FORTUNEO_TAB_UNAVAILABLE");
@@ -421,14 +457,40 @@ async function readAndForwardSnapshot(requestId) {
     return;
   }
   tab.url = readyTab.url;
-  if (isFortuneoAccountUrl(tab.url)) clearAuthFallback(activeSync);
+  if (isFortuneoAccountUrl(tab.url)) {
+    clearAuthFallback(activeSync);
+    if (activeSync.challengeSeen && activeSync.idleTimeoutMs) await resolveFortuneoChallenge(activeSync);
+    if (!activeSync || activeSync.requestId !== requestId) return;
+    if (activeSync.challengeSeen && !activeSync.settledAfterChallenge) {
+      // Fortuneo is still opening the session right after the code: reading (or reloading) the page
+      // now can sign it out. Wait until the account page stays put, then read it.
+      const settling = activeSync;
+      settling.settledAfterChallenge = true;
+      traceAuth(settling, "post-challenge-settle", { path: fortuneoPathShape(tab.url) });
+      await setUi("running", "Waiting for Fortuneo to finish signing in…", []);
+      await new Promise((resolve) => setTimeout(resolve, POST_CHALLENGE_SETTLE_MS));
+      const settled = await chrome.tabs.get(tab.id).catch(() => null);
+      if (activeSync !== settling) return;
+      traceAuth(settling, "post-challenge-settled", { page: fortuneoPageKind(settled?.url), path: fortuneoPathShape(settled?.url), status: settled?.status ?? "closed" });
+      if (!settled || settled.status === "loading" || settled.url !== readyTab.url) {
+        settling.collecting = false;
+        settling.waitingForFortuneo = true;
+        settling.settledAfterChallenge = false;
+        // The page may keep changing without a tab event (single-page app): look again shortly.
+        if (settled) setTimeout(() => { if (activeSync === settling && !settling.collecting) void collectAndForwardSnapshot(requestId); }, 1_000);
+        return;
+      }
+    }
+  }
   const currentAccountIdentity = fortuneoAccountIdentity(tab.url);
   const requestedAccountIdentity = fortuneoAccountIdentity(activeSync.requestedFortuneoUrl);
-  if (requestedAccountIdentity && currentAccountIdentity && requestedAccountIdentity !== currentAccountIdentity && !activeSync.targetNavigationAttempted) {
+  // Accounts are read through the API from any account page (see accountPath below), so a different
+  // account in the tab only needs a page change when the extension cannot read in place.
+  if (requestedAccountIdentity && currentAccountIdentity && requestedAccountIdentity !== currentAccountIdentity && !activeSync.targetNavigationAttempted && !activeSync.readInPlace) {
     activeSync.targetNavigationAttempted = true;
     activeSync.collecting = false;
     activeSync.waitingForFortuneo = true;
-    traceAuth(activeSync, "target-account-restore", { result: "navigate" });
+    traceAuth(activeSync, "target-account-restore", { result: "navigate", from: fortuneoPathShape(tab.url), to: fortuneoPathShape(activeSync.requestedFortuneoUrl) });
     await chrome.tabs.update(tab.id, { url: activeSync.requestedFortuneoUrl });
     await setUi("running", "Returning to the selected Fortuneo account…", []);
     return;
@@ -438,6 +500,15 @@ async function readAndForwardSnapshot(requestId) {
     activeSync.waitingForFortuneo = true;
     const loginProbeId = crypto.randomUUID();
     activeSync.loginProbeId = loginProbeId;
+    if (activeSync.challenge) {
+      const waiting = activeSync;
+      const status = await inspectFortuneoAuthentication(tab.id);
+      if (activeSync !== waiting || waiting.loginProbeId !== loginProbeId) return;
+      traceAuth(waiting, "challenge-status", status);
+      // Still on the code page (or between pages): keep waiting, never sign in again.
+      if (challengeKindForStatus(status) || status.page === "unknown") return;
+      waiting.challenge = null;
+    }
     const loginState = await prepareFortuneoAutoLogin(tab.id);
     traceAuth(activeSync, "login-probe", { ready: Boolean(loginState?.ok && loginState.ready), result: loginState?.error ?? "ready" });
     if (activeSync?.requestId !== requestId || activeSync.loginProbeId !== loginProbeId) {
@@ -445,10 +516,20 @@ async function readAndForwardSnapshot(requestId) {
       return;
     }
     const sync = activeSync;
+    if (FORTUNEO_CHALLENGE_KINDS.includes(loginState?.challenge)) {
+      await handleFortuneoChallenge(sync, tab, loginState.challenge);
+      return;
+    }
     if (loginState?.ok && loginState.navigating) {
       sync.waitingForAuthentication = false;
-      traceAuth(sync, "customer-space-transition", { result: "waiting-for-account" });
+      traceAuth(sync, "customer-space-transition", { result: "waiting-for-account", path: fortuneoPathShape(tab.url) });
       await setUi("running", "Opening your new Fortuneo customer space…", []);
+      // After a code, the new space's sign-in form may replace the welcome page without a tab reload.
+      if (sync.challengeSeen) {
+        setTimeout(() => {
+          if (activeSync === sync && sync.waitingForFortuneo && !sync.collecting) void collectAndForwardSnapshot(sync.requestId);
+        }, 3_000);
+      }
       return;
     }
     if (loginState?.ok && loginState.ready) {
@@ -472,12 +553,16 @@ async function readAndForwardSnapshot(requestId) {
   await setUi("running", "[3/4] Reading Fortuneo…", []);
   if (!activeSync || activeSync.requestId !== requestId) return;
   traceAuth(activeSync, "collection-start", { page: fortuneoPageKind(tab.url) });
+  const collecting = activeSync;
+  collecting.collectionId = crypto.randomUUID();
+  collecting.completedDetails = 0;
   try {
-    response = await sendFortuneoMessage(tab.id, { type: FORTUNEO_COLLECT_MESSAGE });
+    response = await sendFortuneoMessage(tab.id, { type: FORTUNEO_COLLECT_MESSAGE, collectionId: collecting.collectionId, ...(fortuneoAccountPath(collecting.requestedFortuneoUrl) ? { accountPath: fortuneoAccountPath(collecting.requestedFortuneoUrl) } : {}) });
   } catch (error) {
     if (chromeErrorCode(error) === "UNEXPECTED_ERROR") throw error;
     response = { ok: false, error: chromeErrorCode(error) };
   }
+  if (activeSync !== collecting) return;
   traceAuth(activeSync, "collection-response", { ok: Boolean(response?.ok), payloads: Array.isArray(response?.payloads) ? response.payloads.length : 0, result: response?.error ?? "ok" });
   for (const pageKind of Array.isArray(response?.pageKinds) ? response.pageKinds : []) {
     if (["checking", "deferred", "pending"].includes(pageKind)) activeSync.observedPages.add(pageKind);
@@ -487,6 +572,20 @@ async function readAndForwardSnapshot(requestId) {
   if (!response?.ok) {
     activeSync.collecting = false;
     const code = response?.error ?? "FORTUNEO_READ_FAILED";
+    if (code === "FORTUNEO_TAB_NAVIGATING" && (activeSync.readInterruptions ?? 0) < MAX_READ_INTERRUPTIONS) {
+      // Fortuneo can move the tab during a read (e.g. to its "new customer space" page shortly after
+      // signing in). Follow it and read again once the account page is back, instead of failing.
+      const interrupted = activeSync;
+      interrupted.readInterruptions = (interrupted.readInterruptions ?? 0) + 1;
+      interrupted.waitingForFortuneo = true;
+      const current = await chrome.tabs.get(tab.id).catch(() => null);
+      traceAuth(interrupted, "read-interrupted", { attempt: interrupted.readInterruptions, page: fortuneoPageKind(current?.url), path: fortuneoPathShape(current?.url) });
+      await setUi("running", "Fortuneo changed page during the read; resuming…", []);
+      if (current && activeSync === interrupted) {
+        setTimeout(() => { if (activeSync === interrupted && !interrupted.collecting) void collectAndForwardSnapshot(requestId); }, 1_500);
+      }
+      return;
+    }
     if (code === "NO_FORTUNEO_DATA_CAPTURED") {
       activeSync.waitingForFortuneo = true;
       await setUi("running", fortuneoProgressLabel(activeSync), []);
@@ -504,11 +603,25 @@ async function readAndForwardSnapshot(requestId) {
       await setUi("running", "Open your Fortuneo checking account; sync will resume automatically.", []);
       return;
     }
-    if (code === "FORTUNEO_SESSION_EXPIRED") {
+    if (code === "FORTUNEO_SESSION_EXPIRED" && activeSync.challengeSeen) {
+      const waiting = activeSync;
+      waiting.sessionRetries = (waiting.sessionRetries ?? 0) + 1;
+      traceAuth(waiting, "post-challenge-session-retry", { attempt: waiting.sessionRetries });
+      if (waiting.sessionRetries <= 3) {
+        // Fortuneo may still be finishing the session it opened after the code; returning to the
+        // login form here would request another SMS code.
+        waiting.waitingForFortuneo = true;
+        await setUi("running", "Waiting for Fortuneo to finish opening the session…", []);
+        await new Promise((resolve) => setTimeout(resolve, 3_000 * waiting.sessionRetries));
+        if (activeSync === waiting) await collectAndForwardSnapshot(requestId);
+        return;
+      }
+    } else if (code === "FORTUNEO_SESSION_EXPIRED") {
       const reconnecting = activeSync;
       reconnecting.waitingForFortuneo = true;
       reconnecting.waitingForAuthentication = true;
       reconnecting.targetNavigationAttempted = false;
+      traceAuth(reconnecting, "session-expired-login", { from: fortuneoPathShape(tab.url) });
       await setUi("running", "Fortuneo session expired; signing in again…", []);
       await chrome.tabs.update(tab.id, { url: FORTUNEO_LOGIN });
       await waitForFortuneoTabReady(tab.id).catch(() => {});
@@ -520,9 +633,16 @@ async function readAndForwardSnapshot(requestId) {
     clearFortuneoWait(failed);
     activeSync = null;
     port.disconnect();
+    const tabAfterFailure = await chrome.tabs.get(tab.id).catch(() => null);
+    const pageAfterFailure = fortuneoPageKind(tabAfterFailure?.url);
     await stopFortuneoCapture(failed, true);
-    traceAuth(failed, "collection-error", { result: code, ...response?.diagnostic });
-    await setUi("review", syncFailureLabel({ message: code, diagnostic: response?.diagnostic }, "the Fortuneo data read"), [code], null, failed.dryRun ? "preview" : "sync", failed.authTrace);
+    traceAuth(failed, "collection-error", { result: code, page: pageAfterFailure, path: fortuneoPathShape(tabAfterFailure?.url), ...(failed.fortuneoApiIssues ? { apiIssues: failed.fortuneoApiIssues } : {}), ...response?.diagnostic });
+    const failureMessage = code === "FORTUNEO_SESSION_EXPIRED" && failed.challengeSeen
+      ? "Fortuneo accepted the code but refused the data read. The extension did not sign in again, to avoid another SMS. Reload the Fortuneo account page, then sync again. Copy diagnostics to report it."
+      : code === "FORTUNEO_TAB_NAVIGATING" && pageAfterFailure === "login"
+        ? "Fortuneo ended its session while the extension was reading it: the tab went back to the sign-in page. Copy diagnostics to report it."
+        : syncFailureLabel({ message: code, diagnostic: response?.diagnostic }, "the Fortuneo data read");
+    await setUi("review", failureMessage, [code], null, failed.dryRun ? "preview" : "sync", failed.authTrace);
     return;
   }
   activeSync.stage = "preparing-snapshot";
@@ -539,9 +659,11 @@ async function readAndForwardSnapshot(requestId) {
   collectingSync.snapshots.push(snapshot);
   if (collectingSync.requestedFortuneoUrl) await rememberFortuneoAccountUrl(collectingSync.requestedFortuneoUrl);
   if (advanceFortuneoAccount(collectingSync)) {
-    traceAuth(collectingSync, "next-account", { index: collectingSync.accountTargetIndex + 1, total: collectingSync.accountTargets.length });
+    traceAuth(collectingSync, "next-account", { index: collectingSync.accountTargetIndex + 1, total: collectingSync.accountTargets.length, to: fortuneoPathShape(collectingSync.requestedFortuneoUrl) });
     await setUi("running", `[3/4] Reading Fortuneo account ${collectingSync.accountTargetIndex + 1}/${collectingSync.accountTargets.length}…`, []);
-    await chrome.tabs.update(tab.id, { url: collectingSync.requestedFortuneoUrl });
+    // Stay on this page: loading the next account's page after an SMS code sends Fortuneo back to sign-in.
+    collectingSync.readInPlace = true;
+    await collectAndForwardSnapshot(requestId);
     return;
   }
   const combinedSnapshot = combineFortuneoSnapshots(collectingSync.snapshots);
@@ -550,6 +672,15 @@ async function readAndForwardSnapshot(requestId) {
   collectingSync.snapshot = combinedSnapshot;
   collectingSync.port.postMessage({ version: 2, type: "snapshot", requestId, snapshot: combinedSnapshot });
   traceAuth(collectingSync, "snapshot-sent");
+}
+
+function fortuneoAccountPath(url) {
+  if (!isFortuneoAccountUrl(url)) return null;
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return null;
+  }
 }
 
 function advanceFortuneoAccount(sync) {
@@ -561,7 +692,8 @@ function advanceFortuneoAccount(sync) {
   sync.targetNavigationAttempted = true;
   sync.payloads = [];
   sync.collecting = false;
-  sync.autoAuthAttempted = false;
+  // Signing in again after an SMS code would make Fortuneo send another one.
+  sync.autoAuthAttempted = Boolean(sync.challengeSeen);
   sync.waitingForFortuneo = true;
   sync.fortuneoReadStep = "account";
   return true;
@@ -573,6 +705,14 @@ async function sendFortuneoMessage(tabId, message) {
   await injectFortuneoContent(tabId);
   response = await tryFortuneoMessage(tabId, message);
   if (response?.collectorVersion === FORTUNEO_COLLECTOR_VERSION) return response;
+  if (activeSync?.challengeSeen) {
+    // A reload right after an SMS code can sign Fortuneo out; give the page time instead.
+    traceAuth(activeSync, "collector-retry", { reason: "collector-unavailable" });
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    await injectFortuneoContent(tabId);
+    return tryFortuneoMessage(tabId, message);
+  }
+  traceAuth(activeSync, "tab-reload", { reason: "collector-unavailable" });
   await reloadFortuneoTab(tabId);
   await injectFortuneoContent(tabId);
   return tryFortuneoMessage(tabId, message);
@@ -752,6 +892,7 @@ function scheduleSyncTimeout(sync) {
   const remaining = Math.max(0, sync.deadlineAt - Date.now());
   sync.waitTimer = setTimeout(() => {
     if (activeSync !== sync) return;
+    const timerDelayMs = Math.max(0, Date.now() - sync.deadlineAt);
     const port = sync.port;
     activeSync = null;
     clearFortuneoWait(sync);
@@ -759,12 +900,16 @@ function scheduleSyncTimeout(sync) {
     void stopFortuneoCapture(sync, true);
     const message = sync.authIssue === "credentials-unavailable"
       ? "No Fortuneo credentials are stored. Add them in Setup, then sync again."
+      : sync.challenge
+        ? `${sync.challenge === "sms-code" ? "The Fortuneo SMS code was not entered." : "The Fortuneo security check was not completed."} Complete it in the Fortuneo tab and sync will resume; automatic syncs are paused until tomorrow.`
       : sync.waitingForAuthentication
         ? (sync.authenticationMessage ?? "Fortuneo sign-in was not completed. Sign in, then sync again.").replace(/(?:this )?sync will resume automatically\.?/i, "then sync again.")
       : sync.confirmedSnapshot || sync.progressStep === "write"
         ? "Sync stopped after 60 seconds without progress while processing Lunch Money. Some changes may already have been applied. Preview again before resuming."
-        : `Sync stopped after 60 seconds without progress. ${fortuneoDetectionSummary(sync)}`;
-    traceAuth(sync, "sync-timeout", { waitingForAuthentication: sync.waitingForAuthentication });
+        : timerDelayMs >= SYNC_IDLE_TIMEOUT_MS
+          ? `Sync interrupted; the timeout check ran ${Math.round(timerDelayMs / 1000)} seconds late. The browser or computer may have been suspended. Sync again. ${fortuneoDetectionSummary(sync)}`
+          : `Sync stopped after 60 seconds without progress. ${fortuneoDetectionSummary(sync)}`;
+    traceAuth(sync, "sync-timeout", { waitingForAuthentication: sync.waitingForAuthentication, timerDelayMs });
     void setUi("review", message, sync.waitingForAuthentication ? [] : ["SYNC_TIMEOUT"], null, sync.dryRun ? "preview" : "sync", sync.authTrace);
   }, remaining);
 }
@@ -774,7 +919,7 @@ function refreshSyncTimeout(sync) {
   if (sync.waitTimer) clearTimeout(sync.waitTimer);
   sync.waitTimer = null;
   sync.timeoutStartedAt = Date.now();
-  sync.deadlineAt = sync.timeoutStartedAt + SYNC_IDLE_TIMEOUT_MS;
+  sync.deadlineAt = sync.timeoutStartedAt + (sync.idleTimeoutMs ?? SYNC_IDLE_TIMEOUT_MS);
   scheduleSyncTimeout(sync);
 }
 
@@ -787,11 +932,13 @@ function fortuneoProgressLabel(sync) {
 }
 
 function fortuneoDetectionSummary(sync) {
+  if (sync.fortuneoReadStep) return `Last Fortuneo step: ${sync.fortuneoReadStep}; card details processed: ${sync.completedDetails ?? 0}.`;
   const seen = ["checking", "deferred", "pending"].filter((key) => sync.observedPages.has(key));
   return `Pages seen: ${seen.length ? seen.join(", ") : "none"}; Fortuneo resources observed: ${sync.resourceCandidates}; usable responses: ${sync.payloads.length}.`;
 }
 
 function clearFortuneoWait(sync) {
+  clearChallengeWatch(sync);
   if (sync?.waitTimer) clearTimeout(sync.waitTimer);
   if (sync?.handshakeTimer) clearTimeout(sync.handshakeTimer);
   clearAuthFallback(sync);
@@ -809,7 +956,9 @@ async function authenticateFortuneoOrPrompt(sync, tab, loginPrepared = false) {
   sync.waitingForAuthentication = true;
   if (sync.autoAuthAttempted) {
     traceAuth(sync, "auto-auth-skipped", { reason: "already-attempted" });
-    await promptForFortuneoAuthentication(sync, tab, "Automatic sign-in did not open this account. Sign in manually; sync will resume automatically.");
+    await promptForFortuneoAuthentication(sync, tab, sync.challengeSeen
+      ? "Sign in to Fortuneo in the open tab; sync will resume automatically. It was not filled in again, to avoid another SMS code."
+      : "Automatic sign-in did not open this account. Sign in manually; sync will resume automatically.");
     return;
   }
   await setUi("running", "Preparing Fortuneo sign-in…", []);
@@ -849,32 +998,47 @@ async function authenticateFortuneoOrPrompt(sync, tab, loginPrepared = false) {
   await setUi("running", "Signing in to Fortuneo…", []);
   clearAuthFallback(sync);
   const accountTargetIndex = sync.accountTargetIndex;
-  const fallbackTimer = setTimeout(async () => {
-    if (sync.authFallbackTimer !== fallbackTimer) return;
-    sync.authFallbackTimer = null;
-    if (!authenticationIsPending(sync) || sync.accountTargetIndex !== accountTargetIndex) return;
-    const status = await inspectFortuneoAuthentication(tab.id);
-    if (!authenticationIsPending(sync) || sync.accountTargetIndex !== accountTargetIndex) return;
-    traceAuth(sync, "auth-status", status);
-    const message = authenticationStatusMessage(status);
-    await promptForFortuneoAuthentication(sync, tab, message);
-  }, 15_000);
-  sync.authFallbackTimer = fallbackTimer;
+  const fallbackDeadline = Date.now() + 15_000;
+  // Poll so an SMS code prompt is reported within seconds instead of after the fallback delay.
+  const scheduleAuthCheck = () => {
+    const fallbackTimer = setTimeout(async () => {
+      if (sync.authFallbackTimer !== fallbackTimer) return;
+      sync.authFallbackTimer = null;
+      if (!authenticationIsPending(sync) || sync.accountTargetIndex !== accountTargetIndex) return;
+      const status = await inspectFortuneoAuthentication(tab.id);
+      if (!authenticationIsPending(sync) || sync.accountTargetIndex !== accountTargetIndex) return;
+      const challenge = challengeKindForStatus(status);
+      if (challenge) {
+        traceAuth(sync, "auth-status", status);
+        await handleFortuneoChallenge(sync, tab, challenge);
+        return;
+      }
+      if (Date.now() < fallbackDeadline) {
+        scheduleAuthCheck();
+        return;
+      }
+      traceAuth(sync, "auth-status", status);
+      const message = authenticationStatusMessage(status);
+      await promptForFortuneoAuthentication(sync, tab, message);
+    }, 2_500);
+    sync.authFallbackTimer = fallbackTimer;
+  };
+  scheduleAuthCheck();
 }
 
 async function prepareFortuneoAutoLogin(tabId) {
   const message = { type: "fortuneo-auto-login-ready" };
   let response = await tryFortuneoMessage(tabId, message);
-  if (response?.autoLoginVersion === 4) return response;
+  if (response?.autoLoginVersion === 5) return response;
   await chrome.scripting.executeScript({ target: { tabId }, files: ["fortuneo-content.js"] });
   response = await tryFortuneoMessage(tabId, message);
-  return response?.autoLoginVersion === 4 ? response : { ok: false, error: "FORTUNEO_AUTO_LOGIN_UNAVAILABLE" };
+  return response?.autoLoginVersion === 5 ? response : { ok: false, error: "FORTUNEO_AUTO_LOGIN_UNAVAILABLE" };
 }
 
 async function inspectFortuneoAuthentication(tabId) {
   try {
     const response = await tryFortuneoMessage(tabId, { type: "fortuneo-auth-diagnostics" });
-    return response?.autoLoginVersion === 4
+    return response?.autoLoginVersion === 5
       ? { page: response.page, form: response.form, error: response.error, busy: response.busy }
       : { page: "unknown", form: "unknown", error: "diagnostics-unavailable", busy: false };
   } catch (error) {
@@ -885,6 +1049,7 @@ async function inspectFortuneoAuthentication(tabId) {
 function authenticationStatusMessage(status) {
   if (status?.error === "invalid-credentials") return "Fortuneo rejected the stored identifier or password. Update them in Setup, then sync again.";
   if (status?.error === "account-blocked") return "Fortuneo reports that access is blocked. Complete sign-in manually before syncing again.";
+  if (status?.error === "sms-code") return "Enter the code Fortuneo sent by SMS; sync will resume automatically.";
   if (status?.error === "security-challenge") return "Complete the Fortuneo security check; sync will resume automatically.";
   if (status?.error === "technical-error") return "Fortuneo could not complete automatic sign-in. Sign in manually, then sync again.";
   if (status?.busy) return "Fortuneo is still processing sign-in. Complete any prompt shown; sync will resume automatically.";
@@ -978,7 +1143,12 @@ async function failActiveSync(requestId, error) {
   const location = internalErrorLocation(error);
   const hint = internalErrorHint(error);
   const phase = syncStageLabel(failed);
-  traceAuth(failed, "sync-error", { result: code, stage: failed.stage ?? failed.progressStep ?? "setup", kind, location, hint });
+  // Only browser API messages are recorded: other errors (e.g. JSON parsing) can quote Fortuneo data.
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const browserMessage = /^(?:A listener indicated|The message port closed|Could not establish connection|No tab with id|Frame with ID|Cannot access|The page keeping the extension port)/.test(rawMessage)
+    ? rawMessage.replace(/[0-9]+/g, "#").slice(0, 100)
+    : null;
+  traceAuth(failed, "sync-error", { result: code, stage: failed.stage ?? failed.progressStep ?? "setup", kind, location, hint, ...(browserMessage ? { browserMessage } : {}) });
   try {
     await stopFortuneoCapture(failed, true);
   } catch (cleanupError) {
@@ -1019,7 +1189,7 @@ async function stopFortuneoCapture(sync = null, closeCreated = false) {
 function chromeErrorCode(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (/No tab with id|Invalid tab/i.test(message)) return "FORTUNEO_TAB_CLOSED";
-  if (/Frame with ID .* was removed|frame.*removed|navigation|TAB_LOAD_TIMEOUT/i.test(message)) return "FORTUNEO_TAB_NAVIGATING";
+  if (/Frame with ID .* was removed|frame.*removed|navigation|TAB_LOAD_TIMEOUT|message channel (?:is )?closed|back\/forward cache/i.test(message)) return "FORTUNEO_TAB_NAVIGATING";
   if (/Cannot access|permission|host permission/i.test(message)) return "FORTUNEO_TAB_ACCESS_DENIED";
   if (/Receiving end does not exist|Could not establish connection/i.test(message)) return "FORTUNEO_CONTENT_UNAVAILABLE";
   return safeCode(error);
@@ -1086,7 +1256,7 @@ async function setUi(status, message, warnings, details = null, resultOperation 
   const retainedDetails = details ?? ((status === "running" || status === "needs-auth") ? activeSync?.retainedDetails ?? null : null);
   const trace = authTrace ?? activeSync?.authTrace ?? (["review", "error"].includes(status) ? [{ at: 0, event: "sync-error", result: warnings?.[0] ?? "UNEXPECTED_ERROR", phase: "status-publication", kind: "unavailable" }] : null);
   const formattedWarnings = formatUiWarnings(warnings, retainedDetails);
-  const uiState = { status, message: String(message).slice(0, 500), warnings: formattedWarnings, ...(retainedDetails ? { details: retainedDetails } : {}), ...(operation ? { operation } : {}), ...((status === "running" || status === "needs-auth") && activeSync?.progressStep ? { progressStep: activeSync.progressStep } : {}), ...((status === "running" || status === "needs-auth") && activeSync?.progressStep === "fortuneo" && activeSync.fortuneoReadStep ? { fortuneoReadStep: activeSync.fortuneoReadStep } : {}), ...(Array.isArray(trace) && trace.length > 0 && ["review", "error", "needs-auth"].includes(status) ? { authTrace: trace.slice(-30) } : {}), updatedAt: new Date().toISOString(), ...((status === "running" || status === "needs-auth") && activeSync?.deadlineAt ? { startedAt: activeSync.startedAt, timeoutStartedAt: activeSync.timeoutStartedAt, deadlineAt: activeSync.deadlineAt } : {}) };
+  const uiState = { status, message: String(message).slice(0, 500), warnings: formattedWarnings, ...(retainedDetails ? { details: retainedDetails } : {}), ...(operation ? { operation } : {}), ...((status === "running" || status === "needs-auth") && activeSync?.progressStep ? { progressStep: activeSync.progressStep } : {}), ...((status === "running" || status === "needs-auth") && activeSync?.progressStep === "fortuneo" && activeSync.fortuneoReadStep ? { fortuneoReadStep: activeSync.fortuneoReadStep } : {}), ...(Array.isArray(trace) && trace.length > 0 && ["running", "review", "error", "needs-auth"].includes(status) ? { authTrace: trace.slice(-30) } : {}), updatedAt: new Date().toISOString(), ...((status === "running" || status === "needs-auth") && activeSync?.deadlineAt ? { startedAt: activeSync.startedAt, timeoutStartedAt: activeSync.timeoutStartedAt, deadlineAt: activeSync.deadlineAt } : {}) };
   await chrome.storage.session.set({ uiState });
   await updateActionIndicator(status, operation, undefined, formattedWarnings.length);
   const tabs = await chrome.tabs.query({ url: LUNCH_MONEY_URLS });
@@ -1149,8 +1319,37 @@ function formatLunchMoneyFailure(warning) {
 function traceAuth(sync, event, details = {}) {
   if (!sync || !Array.isArray(sync.authTrace)) return;
   const entry = { at: Math.max(0, Date.now() - sync.startedAt), event, ...details };
+  // Keep one line per read step so per-item progress does not push earlier steps out of the trace.
+  const last = sync.authTrace.at(-1);
+  if (event === "fortuneo-read" && last?.event === "fortuneo-read" && last.step === details.step) sync.authTrace.pop();
   sync.authTrace.push(entry);
   if (sync.authTrace.length > 30) sync.authTrace.shift();
+  scheduleTraceFlush(sync);
+}
+
+function scheduleTraceFlush(sync) {
+  // Save the running trace even when the status does not change, so diagnostics show the latest steps.
+  if (typeof activeSync === "undefined" || sync !== activeSync || sync.traceFlushTimer || typeof setTimeout !== "function") return;
+  sync.traceFlushTimer = setTimeout(async () => {
+    sync.traceFlushTimer = null;
+    if (activeSync !== sync) return;
+    const { uiState } = await chrome.storage.session.get("uiState");
+    if (activeSync !== sync || !uiState || !["running", "needs-auth"].includes(uiState.status)) return;
+    await chrome.storage.session.set({ uiState: { ...uiState, authTrace: sync.authTrace.slice(-30) } });
+  }, 500);
+}
+
+function fortuneoPathShape(url) {
+  // Route shape only: identifiers are masked and query values dropped, so diagnostics stay private.
+  try {
+    const parsed = new URL(url);
+    if (parsed.origin !== "https://mabanque.fortuneo.fr") return "external";
+    const path = parsed.pathname.split("/").map((part) => (part === "" || (/^[a-z]+(?:-[a-z]+)*$/.test(part) && part.length <= 24) ? part : ":id")).join("/");
+    const keys = [...parsed.searchParams.keys()].filter((key) => /^[A-Za-z0-9_-]{1,24}$/.test(key)).slice(0, 6);
+    return `${path}${keys.length ? `?${keys.join("&")}` : ""}${parsed.hash ? "#" : ""}`.slice(0, 120);
+  } catch {
+    return "unknown";
+  }
 }
 
 function fortuneoPageKind(url) {
@@ -1161,13 +1360,19 @@ function fortuneoPageKind(url) {
 }
 
 async function updateActionIndicator(status, operation, lastSuccessfulLocalDate, warningCount = 0) {
-  if (lastSuccessfulLocalDate === undefined) {
-    ({ lastSuccessfulLocalDate } = await chrome.storage.local.get("lastSuccessfulLocalDate"));
-  }
+  const stored = await chrome.storage.local.get(["lastSuccessfulLocalDate", "fortuneoChallengeLocalDate", "fortuneoChallengeKind"]);
+  if (lastSuccessfulLocalDate === undefined) lastSuccessfulLocalDate = stored.lastSuccessfulLocalDate;
+  const challengePending = Boolean(stored.fortuneoChallengeKind) && stored.fortuneoChallengeLocalDate === localDate() && lastSuccessfulLocalDate !== localDate();
   let text;
   let color = "#2b8066";
   let title;
-  if (status === "running") {
+  if (challengePending && !["running", "success", "warning"].includes(status)) {
+    text = stored.fortuneoChallengeKind === "sms-code" ? "SMS" : "2FA";
+    color = "#7a3fb0";
+    title = stored.fortuneoChallengeKind === "sms-code"
+      ? "Fortuneo is waiting for the SMS code. Enter it in the Fortuneo tab; automatic sync is paused until tomorrow."
+      : "Fortuneo is waiting for a security check. Complete it in the Fortuneo tab; automatic sync is paused until tomorrow.";
+  } else if (status === "running") {
     text = "…";
     color = "#3677b5";
     title = operation === "preview" ? "Preparing the Fortuneo setup preview" : "Fortuneo sync in progress";
@@ -1324,4 +1529,136 @@ function cardReviewNotification(warnings, keys, reportedKeys, dryRun) {
     warnings: warnings.filter((warning) => dryRun || warning !== "SETTLED_CARD_REFERENCE_UNRESOLVED" || hasNewReview || keys.length === 0),
     keys: [...new Set(keys)],
   };
+}
+
+function challengeKindForStatus(status) {
+  return FORTUNEO_CHALLENGE_KINDS.includes(status?.error) ? status.error : null;
+}
+
+async function handleFortuneoChallenge(sync, tab, kind) {
+  if (activeSync !== sync) return;
+  sync.waitingForFortuneo = true;
+  sync.waitingForAuthentication = true;
+  if (sync.challenge) return;
+  sync.challenge = kind;
+  sync.challengeSeen = true;
+  sync.challengeCount = (sync.challengeCount ?? 0) + 1;
+  // Signing in again after a code would make Fortuneo send another one.
+  sync.autoAuthAttempted = true;
+  sync.idleTimeoutMs = FORTUNEO_CHALLENGE_TIMEOUT_MS;
+  // The user needs this tab to type the code, also after the sync gives up.
+  sync.fortuneoTabCreated = false;
+  clearAuthFallback(sync);
+  traceAuth(sync, "security-challenge", { kind });
+  await chrome.storage.local.set({ fortuneoChallengeLocalDate: localDate(), fortuneoChallengeKind: kind });
+  refreshSyncTimeout(sync);
+  if (tab.id !== undefined) {
+    await chrome.storage.session.set({ fortuneoChallengeTabId: tab.id });
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+  }
+  if (activeSync !== sync) return;
+  const message = authenticationStatusMessage({ error: kind });
+  sync.authenticationMessage = message;
+  await setUi("needs-auth", message, []);
+  await showFortuneoChallengeNotification(kind);
+  if (tab.id !== undefined) watchFortuneoChallenge(sync, tab.id);
+}
+
+function watchFortuneoChallenge(sync, tabId) {
+  // Fortuneo can leave the code page without reloading the tab, so no tab event announces it.
+  clearChallengeWatch(sync);
+  sync.challengeWatch = setInterval(async () => {
+    if (activeSync !== sync || !sync.challenge) {
+      clearChallengeWatch(sync);
+      return;
+    }
+    const status = await inspectFortuneoAuthentication(tabId);
+    if (activeSync !== sync || !sync.challenge || challengeKindForStatus(status) || status.page === "unknown") return;
+    clearChallengeWatch(sync);
+    traceAuth(sync, "challenge-left", { page: status.page });
+    sync.challenge = null;
+    await collectAndForwardSnapshot(sync.requestId);
+  }, 2_000);
+}
+
+function clearChallengeWatch(sync) {
+  if (sync?.challengeWatch) clearInterval(sync.challengeWatch);
+  if (sync) sync.challengeWatch = null;
+}
+
+async function resolveFortuneoChallenge(sync) {
+  traceAuth(sync, "security-challenge-resolved", { kind: sync.challenge });
+  clearChallengeWatch(sync);
+  sync.challenge = null;
+  sync.idleTimeoutMs = null;
+  refreshSyncTimeout(sync);
+  // Keep automatic syncs paused for the day (only a success lifts it); the code itself is no longer awaited.
+  await chrome.storage.local.set({ fortuneoChallengeKind: null });
+  await clearFortuneoChallengeNotification();
+}
+
+async function resumeAfterFortuneoChallenge(tabId) {
+  // The code was entered after the sync gave up: finish today's sync with the now-open session.
+  const { fortuneoChallengeLocalDate, fortuneoChallengeKind, lastSuccessfulLocalDate, setupPreviewConfirmed } = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  if (activeSync || syncStartPending || !setupPreviewConfirmed || !fortuneoChallengeKind || fortuneoChallengeLocalDate !== localDate() || lastSuccessfulLocalDate === localDate()) return false;
+  await chrome.storage.local.set({ fortuneoChallengeKind: null });
+  await clearFortuneoChallengeNotification();
+  return startSync("sync-if-due", null, { fortuneoTabId: tabId, afterChallenge: true });
+}
+
+async function showFortuneoChallengeNotification(kind) {
+  if (!chrome.notifications) return;
+  try {
+    await chrome.notifications.clear(FORTUNEO_CHALLENGE_NOTIFICATION);
+    await chrome.notifications.create(FORTUNEO_CHALLENGE_NOTIFICATION, {
+      type: "basic",
+      iconUrl: await challengeNotificationIcon(kind),
+      title: kind === "sms-code" ? "Fortuneo sent you an SMS code" : "Fortuneo needs a security check",
+      message: kind === "sms-code"
+        ? "Enter the code in the Fortuneo tab to finish today's Lunch Money sync."
+        : "Complete the check in the Fortuneo tab to finish today's Lunch Money sync.",
+      priority: 2,
+      requireInteraction: true,
+    });
+  } catch {
+    // The toolbar badge still reports the pending code.
+  }
+}
+
+async function clearFortuneoChallengeNotification() {
+  try {
+    await chrome.notifications?.clear(FORTUNEO_CHALLENGE_NOTIFICATION);
+    await chrome.storage.session.remove("fortuneoChallengeTabId");
+  } catch {
+    // Nothing to clear.
+  }
+}
+
+async function showFortuneoChallengeTab() {
+  const { fortuneoChallengeTabId } = await chrome.storage.session.get("fortuneoChallengeTabId");
+  const tab = Number.isSafeInteger(fortuneoChallengeTabId) ? await chrome.tabs.get(fortuneoChallengeTabId).catch(() => null) : null;
+  if (tab?.id !== undefined && tab.url?.startsWith("https://mabanque.fortuneo.fr/")) {
+    await chrome.tabs.update(tab.id, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+  } else {
+    await chrome.tabs.create({ url: FORTUNEO_LOGIN, active: true });
+  }
+}
+
+async function challengeNotificationIcon(kind) {
+  const canvas = new OffscreenCanvas(128, 128);
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#7a3fb0";
+  context.beginPath();
+  context.roundRect(0, 0, 128, 128, 28);
+  context.fill();
+  context.fillStyle = "#ffffff";
+  context.font = "bold 44px sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(kind === "sms-code" ? "SMS" : "2FA", 64, 68);
+  const bytes = new Uint8Array(await (await canvas.convertToBlob({ type: "image/png" })).arrayBuffer());
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `data:image/png;base64,${btoa(binary)}`;
 }
