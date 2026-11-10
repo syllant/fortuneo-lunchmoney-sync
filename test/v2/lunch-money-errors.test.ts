@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { LunchMoneyError } from "@lunch-money/lunch-money-js-v2";
-import { LunchMoneyGateway, lunchMoneyFailureCode } from "../../packages/native-host/src/lunch-money.js";
+import { LunchMoneyGateway, lunchMoneyFailureCode, lunchMoneyRejectionReason } from "../../packages/native-host/src/lunch-money.js";
 import { safeErrorCode, safeErrorDiagnostic, SyncPhaseError } from "../../packages/native-host/src/redaction.js";
 
 describe("Lunch Money failure diagnostics", () => {
@@ -43,6 +43,16 @@ describe("Lunch Money failure diagnostics", () => {
 
     await expect(gateway.updateTransaction(123, { payee: "Updated" }))
       .rejects.toThrow("LUNCH_MONEY_UPDATE_TRANSACTION_HTTP_400");
+  });
+
+  it("reports a fixed rejection reason without exposing Lunch Money's message", () => {
+    const cause = new LunchMoneyError("Request Validation Failure", 400, { message: "Request Validation Failure", errors: [{ errMsg: "Transaction 12 for SECRET SHOP: external_id already exists" }] });
+    const error = Object.assign(new Error("LUNCH_MONEY_UPDATE_TRANSACTION_HTTP_400", { cause }), { lunchMoneyReason: lunchMoneyRejectionReason(cause) });
+
+    const diagnostic = safeErrorDiagnostic(new SyncPhaseError("writing-transactions", error));
+
+    expect(diagnostic.hint).toBe("Lunch Money rejected the request (reason: duplicate-external-id)");
+    expect(JSON.stringify(diagnostic)).not.toContain("SECRET");
   });
 
   it("batches transaction updates and retries a rate limit once", async () => {

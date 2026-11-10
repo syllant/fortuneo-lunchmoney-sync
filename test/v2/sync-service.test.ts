@@ -33,6 +33,33 @@ describe("dry-run account simulation", () => {
     expect(progressTimes).toHaveLength(5);
     expect(progressTimes.every((time, index) => time - (progressTimes[index - 1] ?? 0) < 60_000)).toBe(true);
   });
+  it("releases external ids before re-keying, updating and creating", async () => {
+    const calls: string[] = [];
+    const service = new SyncService({} as KeychainStore, () => undefined);
+    const gateway = {
+      deleteTransaction: async (id: number) => { calls.push(`delete:${id}`); },
+      clearTransactionExternalIds: async (ids: number[]) => { calls.push(`clear:${ids.join(",")}`); },
+      updateTransactions: async (updates: { id: number }[]) => { calls.push(`update:${updates.map((update) => update.id).join(",")}`); },
+      createTransaction: async () => { calls.push("create"); return 900; },
+    } as unknown as LunchMoneyGateway;
+    const metadata = { schema_version: 2 as const, source_identity: "x", lifecycle: "deferred" as const, payload_fingerprint: "f", last_seen_at: "2026-11-10T00:00:00.000Z", miss_count: 0, aliases: [] };
+    const operations: ReconciliationOperation[] = [
+      { kind: "create-transaction", sourceId: "new", transaction: { accountId: 11, date: "2026-11-01", amount: "1", currency: "eur", payee: "P", tagIds: [], externalId: "lmft:v2:new", metadata } },
+      { kind: "update-transaction", id: 1, sourceId: "a", patch: { externalId: "lmft:v2:b", metadata } },
+      { kind: "update-transaction", id: 2, sourceId: "b", patch: { metadata } },
+      { kind: "delete-cancelled-pending", id: 3, sourceIdentity: "gone" },
+    ];
+    const summary: ResultSummary = { created: 0, updated: 0, deleted: 0, warnings: [], message: "test", breakdown: {
+      accountsCreated: 0, accountsUpdated: 0, transactionsCreated: 0, transactionsUpdated: 0, transactionsDeleted: 0, fortuneoSettled: 0, fortuneoDeferred: 0, fortuneoPending: 0,
+    } };
+    const writer = service as unknown as { applyTransactions(gateway: LunchMoneyGateway, operations: ReconciliationOperation[], summary: ResultSummary, requestId: string): Promise<void> };
+
+    await writer.applyTransactions(gateway, operations, summary, "order");
+
+    expect(calls).toEqual(["delete:3", "clear:1", "update:1,2", "create"]);
+    expect(summary).toMatchObject({ created: 1, updated: 2, deleted: 1 });
+  });
+
   it("makes planned card accounts available to transaction reconciliation without writing them", () => {
     const accounts: ExistingAccount[] = [{ id: 10, name: "Checking", type: "checking", balance: "100", currency: "eur", externalId: null, metadata: null }];
     const metadata = { schema_version: 2 as const, source_identity: "source", lifecycle: "account" as const, payload_fingerprint: "fingerprint", last_seen_at: "2026-08-25T00:00:00.000Z", miss_count: 0, aliases: [] };

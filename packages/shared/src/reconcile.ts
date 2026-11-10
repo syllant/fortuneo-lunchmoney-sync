@@ -127,6 +127,9 @@ export function planTransactions(
     } });
   }
 
+  // Identities claimed by a source in this snapshot must never be taken by
+  // another source's fingerprint fallback, or two rows would share one external_id.
+  const snapshotIdentities = new Set(snapshot.transactions.map((source) => identity.digest("transaction", source.sourceId)));
   for (let sourceIndex = 0; sourceIndex < snapshot.transactions.length; sourceIndex += 1) {
     const source = snapshot.transactions[sourceIndex]!;
     const booking = checkingBookings.get(`${source.accountSourceId}\0${source.sourceId}`);
@@ -146,8 +149,8 @@ export function planTransactions(
     const fingerprint = transactionFingerprint(source, identity);
     if (managed.some((candidate) => confirmedIds.has(candidate.id) && candidate.accountId === accountId
       && (candidate.metadata?.source_identity === sourceIdentity || candidate.metadata?.aliases.includes(sourceIdentity)))) continue;
-    let match = managed.find((candidate) => !matchedIds.has(candidate.id) && candidate.accountId === accountId
-      && (candidate.metadata?.source_identity === sourceIdentity || candidate.metadata?.aliases.includes(sourceIdentity)));
+    let match = managed.find((candidate) => !matchedIds.has(candidate.id) && candidate.accountId === accountId && candidate.metadata?.source_identity === sourceIdentity)
+      ?? managed.find((candidate) => !matchedIds.has(candidate.id) && candidate.accountId === accountId && candidate.metadata?.aliases.includes(sourceIdentity));
     if (!match && accountId === ids.checkingAccountId) {
       const legacyCandidates = legacyChecking.filter((candidate) => !matchedIds.has(candidate.id) && candidate.date === source.date && candidate.amount === source.amount && normalizeMerchant(candidate.payee) === normalizeMerchant(source.merchant));
       if (legacyCandidates.length > 1) {
@@ -157,7 +160,8 @@ export function planTransactions(
       match = legacyCandidates[0];
     }
     if (!match) {
-      const candidates = managed.filter((candidate) => !matchedIds.has(candidate.id) && candidate.accountId === accountId && candidate.metadata?.payload_fingerprint === fingerprint);
+      const candidates = managed.filter((candidate) => !matchedIds.has(candidate.id) && candidate.accountId === accountId && candidate.metadata?.payload_fingerprint === fingerprint
+        && !claimedByOtherSource(candidate.metadata, sourceIdentity, snapshotIdentities));
       if (candidates.length > 1) {
         match = lifecycleCandidate(candidates, source.lifecycle)
           ?? groupedFingerprintCandidate(snapshot.transactions, sourceIndex, sourceAccountToBudget, managed, matchedIds, candidates, source, accountId, fingerprint, identity);
@@ -198,7 +202,8 @@ export function planTransactions(
     } else {
       matchedIds.add(match.id);
       if (match.groupParentId !== null) continue;
-      const patch: Partial<DesiredTransaction> = { date: source.date, amount: source.amount, currency: source.currency, tagIds, externalId, metadata: nextMetadata };
+      const patch: Partial<DesiredTransaction> = { date: source.date, amount: source.amount, currency: source.currency, tagIds, metadata: nextMetadata };
+      if (match.externalId !== externalId) patch.externalId = externalId;
       if (source.lifecycle === "pending" || source.lifecycle === "deferred") patch.payee = source.merchant;
       if (historicalCategoryId !== undefined) patch.categoryId = historicalCategoryId;
       operations.push({
@@ -225,6 +230,10 @@ export function planTransactions(
 
   planSyntheticDeletion(snapshot, transactions, operations, warnings);
   return { operations, warnings };
+}
+
+function claimedByOtherSource(metadata: IntegrationMetadata, sourceIdentity: string, snapshotIdentities: ReadonlySet<string>): boolean {
+  return [metadata.source_identity, ...metadata.aliases].some((claimed) => claimed !== sourceIdentity && snapshotIdentities.has(claimed));
 }
 
 function groupedFingerprintCandidate(

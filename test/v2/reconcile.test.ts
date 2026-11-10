@@ -153,6 +153,36 @@ describe("transaction reconciliation", () => {
     expect(plan.operations.filter((operation) => operation.kind === "update-transaction")).toHaveLength(2);
   });
 
+  it("never re-keys a transaction whose own source is still in the snapshot", () => {
+    const owned = managedFor("kept", { sourceId: "kept", accountSourceId: "world", date: "2026-08-20", amount: "2.9", currency: "eur", merchant: "Coffee", lifecycle: "deferred" }, 30);
+    const snapshot = baseSnapshot();
+    snapshot.transactions = [
+      { sourceId: "new-twin", accountSourceId: "world", date: "2026-08-20", amount: "2.9", currency: "eur", merchant: "Coffee", lifecycle: "deferred" },
+      { sourceId: "kept", accountSourceId: "world", date: "2026-08-20", amount: "2.9", currency: "eur", merchant: "Coffee", lifecycle: "deferred" },
+    ];
+
+    const plan = planTransactions(snapshot, accounts, [owned], identity, ids);
+
+    expect(plan.operations).toContainEqual(expect.objectContaining({ kind: "create-transaction", sourceId: "new-twin" }));
+    const update = plan.operations.find((operation) => operation.kind === "update-transaction");
+    expect(update).toMatchObject({ id: 30, sourceId: "kept" });
+    if (update?.kind !== "update-transaction") throw new Error("missing update");
+    expect(update.patch).not.toHaveProperty("externalId");
+  });
+
+  it("prefers the transaction that owns an identity over one that only aliases it", () => {
+    const source = { sourceId: "op", accountSourceId: "world", date: "2026-08-20", amount: "5", currency: "eur", merchant: "Shop", lifecycle: "settled" } as const;
+    const owner = managedFor("op", source, 41);
+    const aliased = { ...managedFor("other", { ...source, sourceId: "other" }, 40) };
+    aliased.metadata = { ...aliased.metadata!, aliases: [identity.digest("transaction", "op")] };
+    const snapshot = baseSnapshot();
+    snapshot.transactions = [source];
+
+    const update = planTransactions(snapshot, accounts, [aliased, owner], identity, ids).operations.find((operation) => operation.kind === "update-transaction" && operation.sourceId === "op");
+
+    expect(update).toMatchObject({ id: 41 });
+  });
+
   it("ignores legacy settlement mirrors and never recreates their transfer offsets", () => {
     const snapshot = baseSnapshot();
     snapshot.transactions = [{ sourceId: "payment", accountSourceId: "checking", date: "2026-08-25", amount: "100", currency: "eur", merchant: "CARTE DIFFEREE", lifecycle: "settled" }];
@@ -243,4 +273,12 @@ function managedPending(missCount: number): ExistingTransaction {
   const create = planTransactions(snapshot, accounts, [], identity, ids).operations.find((operation) => operation.kind === "create-transaction");
   if (create?.kind !== "create-transaction") throw new Error("missing create");
   return { id: 70, accountId: 11, date: "2026-08-20", amount: "12", currency: "eur", payee: "Merchant", notes: null, categoryId: null, tagIds: [20], externalId: create.transaction.externalId, metadata: { ...create.transaction.metadata, miss_count: missCount }, groupParentId: null };
+}
+
+function managedFor(sourceId: string, source: FortuneoSnapshot["transactions"][number], id: number): ExistingTransaction {
+  const snapshot = baseSnapshot();
+  snapshot.transactions = [{ ...source, sourceId }];
+  const create = planTransactions(snapshot, accounts, [], identity, ids).operations.find((operation) => operation.kind === "create-transaction");
+  if (create?.kind !== "create-transaction") throw new Error("missing create");
+  return { id, accountId: 11, date: source.date, amount: source.amount, currency: "eur", payee: source.merchant, notes: null, categoryId: null, tagIds: create.transaction.tagIds, externalId: create.transaction.externalId, metadata: create.transaction.metadata, groupParentId: null };
 }

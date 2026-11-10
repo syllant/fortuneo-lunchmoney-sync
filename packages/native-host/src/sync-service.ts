@@ -188,21 +188,28 @@ export class SyncService {
     requestId: string,
   ): Promise<void> {
     const updates = operations.filter((operation) => operation.kind === "update-transaction");
+    // Free external_ids first: deletions and re-keyed rows release values that
+    // updates and creations may claim, and Lunch Money rejects any duplicate.
     for (const operation of operations) {
-      if (operation.kind === "create-transaction") {
-        await gateway.createTransaction(operation.transaction);
-        summary.created += 1;
-        summary.breakdown.transactionsCreated += 1;
-        this.progress(requestId, "writing-transactions");
-      } else if (operation.kind === "delete-cancelled-pending" || operation.kind === "delete-replaced-synthetic") {
+      if (operation.kind === "delete-cancelled-pending" || operation.kind === "delete-replaced-synthetic") {
         await gateway.deleteTransaction(operation.id);
         summary.deleted += 1;
         summary.breakdown.transactionsDeleted += 1;
         this.progress(requestId, "writing-transactions");
       }
     }
+    const rekeyed = updates.filter((operation) => operation.patch.externalId !== undefined).map((operation) => operation.id);
+    if (rekeyed.length > 0) await gateway.clearTransactionExternalIds(rekeyed);
     await gateway.updateTransactions(updates.map((operation) => ({ id: operation.id, patch: operation.patch })));
     this.progress(requestId, "writing-transactions");
+    for (const operation of operations) {
+      if (operation.kind === "create-transaction") {
+        await gateway.createTransaction(operation.transaction);
+        summary.created += 1;
+        summary.breakdown.transactionsCreated += 1;
+        this.progress(requestId, "writing-transactions");
+      }
+    }
     summary.updated += updates.length;
     summary.breakdown.transactionsUpdated += updates.length;
   }

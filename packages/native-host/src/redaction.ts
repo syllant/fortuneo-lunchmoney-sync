@@ -50,6 +50,8 @@ export function safeErrorDiagnostic(error: unknown): SafeErrorDiagnostic {
 }
 
 function safeErrorHint(error: unknown): string {
+  const reason = error instanceof Error ? (error as { lunchMoneyReason?: unknown }).lunchMoneyReason : undefined;
+  if (typeof reason === "string" && /^[a-z+-]{1,120}$/.test(reason)) return `Lunch Money rejected the request (reason: ${reason})`;
   if (error instanceof TypeError) return "An operation received an unexpected data type";
   if (error instanceof SyntaxError) return "A response could not be parsed";
   if (error instanceof RangeError) return "A value exceeded the supported range";

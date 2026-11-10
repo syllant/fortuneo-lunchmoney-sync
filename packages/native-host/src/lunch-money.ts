@@ -149,6 +149,13 @@ export class LunchMoneyGateway {
     }
   }
 
+  async clearTransactionExternalIds(ids: readonly number[]): Promise<void> {
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const transactions: UpdateTransactionsBody["transactions"] = ids.slice(offset, offset + 500).map((id) => ({ id, external_id: null }));
+      await this.call("UPDATE_TRANSACTION", () => this.client.transactions.updateMany({ transactions }));
+    }
+  }
+
   async deleteTransaction(id: number): Promise<void> {
     await this.call("DELETE_TRANSACTION", () => this.client.transactions.delete(id));
   }
@@ -167,7 +174,7 @@ export class LunchMoneyGateway {
           continue;
         }
         if (error instanceof LunchMoneyError && (error.status === 401 || error.status === 403)) throw new Error("LUNCH_MONEY_AUTH_REQUIRED", { cause: error });
-        throw new Error(lunchMoneyFailureCode(operation, error), { cause: error });
+        throw Object.assign(new Error(lunchMoneyFailureCode(operation, error), { cause: error }), { lunchMoneyReason: lunchMoneyRejectionReason(error) });
       }
     }
   }
@@ -196,6 +203,30 @@ export function lunchMoneyFailureCode(operation: LunchMoneyOperation, error: unk
   }
   if (error instanceof TypeError) return `LUNCH_MONEY_${operation}_NETWORK_FAILED`;
   return `LUNCH_MONEY_${operation}_FAILED`;
+}
+
+const REJECTION_REASONS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/external[_ ]?id/i, "duplicate-external-id"],
+  [/split/i, "split-transaction"],
+  [/group/i, "grouped-transaction"],
+  [/categor/i, "invalid-category"],
+  [/tag/i, "invalid-tag"],
+  [/currenc/i, "invalid-currency"],
+  [/amount/i, "invalid-amount"],
+  [/date/i, "invalid-date"],
+  [/payee/i, "invalid-payee"],
+  [/metadata/i, "invalid-metadata"],
+  [/not (?:be )?found|does not exist|no transaction/i, "transaction-not-found"],
+];
+
+/** Maps Lunch Money's free-text rejection to a fixed token that is safe to show. */
+export function lunchMoneyRejectionReason(error: unknown): string | undefined {
+  if (!(error instanceof LunchMoneyError) || error.status !== 400) return undefined;
+  const data = error.data as { errors?: unknown } | undefined;
+  const messages = (Array.isArray(data?.errors) ? data.errors : error.errors)
+    .map((detail: unknown) => (typeof detail === "object" && detail !== null && typeof (detail as { errMsg?: unknown }).errMsg === "string" ? (detail as { errMsg: string }).errMsg : ""));
+  const reasons = new Set(messages.map((message: string) => REJECTION_REASONS.find(([pattern]) => pattern.test(message))?.[1] ?? "unrecognized"));
+  return reasons.size === 0 ? "unrecognized" : [...reasons].sort().join("+");
 }
 
 export function managedAccountName(source: FortuneoAccountSnapshot): string {
