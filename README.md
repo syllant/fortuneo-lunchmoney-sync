@@ -49,7 +49,7 @@ npm run install:local -- <extension-id>
 
 Restart Chrome once. Open the extension popup, enter the Fortuneo identifier and password plus the Lunch Money token, load accounts, select the existing Fortuneo checking account, and save. Secret inputs are cleared after being passed directly to the helper.
 
-For daily use, opening Lunch Money triggers one automatic sync per local calendar day. Every Fortuneo account route previously discovered by the extension is read in a temporary background tab, so the checking account, cards, and savings accounts are reconciled together. A failed automatic attempt may retry after a 15-minute cooldown. If the Fortuneo session has expired, sign in when prompted and the sync resumes. The popup shows whether today has synced successfully and also provides manual **Sync now** and optional **Preview changes** actions.
+For daily use, opening Lunch Money triggers one automatic sync per local calendar day. Because Fortuneo may ask for an SMS code at sign-in, automatic syncs start only while Chrome is the focused app, the Lunch Money tab is shown, and the Mac is not idle or locked; a sync skipped in the background starts when you return to Lunch Money. Every Fortuneo account route previously discovered by the extension is read in a temporary background tab, so the checking account, cards, and savings accounts are reconciled together. A failed automatic attempt may retry after a 15-minute cooldown. If the Fortuneo session has expired, sign in when prompted and the sync resumes. The popup shows whether today has synced successfully and also provides manual **Sync now** and optional **Preview changes** actions.
 
 ## Fortuneo adapter rollout
 

@@ -16,6 +16,8 @@ const FORTUNEO_CHALLENGE_NOTIFICATION = "fortuneo-security-challenge";
 const FORTUNEO_CHALLENGE_KINDS = ["sms-code", "security-challenge"];
 const POST_CHALLENGE_SETTLE_MS = 4_000;
 const MAX_READ_INTERRUPTIONS = 2;
+// Fortuneo may ask for an SMS code at sign-in, so automatic syncs start only while someone is at the computer.
+const USER_IDLE_THRESHOLD_SECONDS = 120;
 const DEFAULT_SETTINGS = { lastSuccessfulLocalDate: null, fortuneoChallengeLocalDate: null, fortuneoChallengeKind: null, lastSuccessfulAt: null, lastSyncAttemptLocalDate: null, lastSyncAttemptAt: null, setupPreviewConfirmed: false, uiState: { status: "idle", message: "Ready", warnings: [] } };
 
 let activeSync = null;
@@ -48,6 +50,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   void syncForLunchMoneyTab(tabId);
+});
+
+// A sync skipped while Chrome was in the background starts when the user comes back to Lunch Money.
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) void initialized.then(() => syncIfDue());
+});
+chrome.idle?.onStateChanged.addListener((state) => {
+  if (state === "active") void initialized.then(() => syncIfDue());
 });
 
 chrome.notifications?.onClicked.addListener((notificationId) => {
@@ -218,7 +228,18 @@ async function syncIfDue() {
   const attemptedRecently = lastSyncAttemptVersion === chrome.runtime.getManifest().version
     && Number.isFinite(lastAttemptAge) && lastAttemptAge >= 0 && lastAttemptAge < SYNC_RETRY_COOLDOWN_MS;
   if (!setupPreviewConfirmed || lastSuccessfulLocalDate === localDate() || attemptedRecently || activeSync || syncStartPending) return false;
+  if (!await userIsOnLunchMoney()) return false;
   return startSync("sync-if-due");
+}
+
+// True only when Chrome is the focused app, shows Lunch Money, and the user is not idle or locked:
+// a background sync could ask for an SMS code that nobody is there to enter.
+async function userIsOnLunchMoney() {
+  const window = await chrome.windows.getLastFocused({ populate: true }).catch(() => null);
+  if (!window?.focused || window.state === "minimized") return false;
+  if (!isLunchMoneyUrl(window.tabs?.find((tab) => tab.active)?.url)) return false;
+  const idleState = await chrome.idle?.queryState(USER_IDLE_THRESHOLD_SECONDS).catch(() => "active");
+  return idleState === undefined || idleState === "active";
 }
 
 async function startSync(type, confirmedSnapshot = null, options = {}) {

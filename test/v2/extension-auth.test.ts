@@ -246,7 +246,7 @@ describe("Fortuneo collection progress", () => {
 
 const retrySource = source.slice(source.indexOf("async function scheduleSyncRetries("), source.indexOf("function validateToken("));
 const tabSource = source.slice(source.indexOf("async function syncForLunchMoneyTab("), source.indexOf("async function initializeStorage("));
-const dueSource = source.slice(source.indexOf("async function syncIfDue("), source.indexOf("async function startSync("));
+const dueSource = source.slice(source.indexOf("async function syncIfDue("), source.indexOf("async function userIsOnLunchMoney("));
 const startupFailureSource = source.slice(source.indexOf("async function reportStartupFailure("), source.indexOf("function enqueueNativeMessage("));
 
 describe("automatic daily sync", () => {
@@ -309,7 +309,7 @@ describe("automatic daily sync", () => {
     await runInNewContext(`${dueSource}\nsyncIfDue()`, {
       chrome: { runtime: { getManifest: () => ({ version: "test-version" }) }, storage: { local: { get: vi.fn().mockResolvedValue({ lastSuccessfulLocalDate, lastSyncAttemptAt, lastSyncAttemptVersion: "test-version", setupPreviewConfirmed: true }) } } },
       DEFAULT_SETTINGS: {}, SYNC_RETRY_COOLDOWN_MS: 15 * 60_000,
-      localDate: () => "today", activeSync: null, syncStartPending: false, startSync,
+      localDate: () => "today", activeSync: null, syncStartPending: false, startSync, userIsOnLunchMoney: async () => true,
     });
     expect(startSync).toHaveBeenCalledTimes(count);
   });
@@ -410,8 +410,47 @@ it.each([null, "previous-version"])("automatically retries after an upgrade desp
     }) } } },
     DEFAULT_SETTINGS: {}, SYNC_RETRY_COOLDOWN_MS: 15 * 60_000,
     localDate: () => "today", activeSync: null, syncStartPending: false, startSync,
+    userIsOnLunchMoney: async () => true,
   });
   expect(startSync).toHaveBeenCalledWith("sync-if-due");
+});
+
+it("does not start an automatic sync while nobody is looking at Lunch Money", async () => {
+  const startSync = vi.fn().mockResolvedValue(true);
+  const started = await runInNewContext(`${dueSource}\nsyncIfDue()`, {
+    chrome: { runtime: { getManifest: () => ({ version: "v" }) }, storage: { local: { get: vi.fn().mockResolvedValue({
+      lastSuccessfulLocalDate: null, lastSyncAttemptAt: null, lastSyncAttemptVersion: null, setupPreviewConfirmed: true,
+    }) } } },
+    DEFAULT_SETTINGS: {}, SYNC_RETRY_COOLDOWN_MS: 15 * 60_000,
+    localDate: () => "today", activeSync: null, syncStartPending: false, startSync,
+    userIsOnLunchMoney: async () => false,
+  });
+  expect(started).toBe(false);
+  expect(startSync).not.toHaveBeenCalled();
+});
+
+describe("user presence before an automatic sync", () => {
+  const presenceSource = source.slice(source.indexOf("async function userIsOnLunchMoney("), source.indexOf("async function startSync("));
+  const lunchMoney = "https://my.lunchmoney.app/overview";
+  const check = (window: unknown, idleState = "active") => runInNewContext(`${presenceSource}\nuserIsOnLunchMoney()`, {
+    USER_IDLE_THRESHOLD_SECONDS: 120,
+    isLunchMoneyUrl: (url: string) => typeof url === "string" && url.startsWith("https://my.lunchmoney.app"),
+    chrome: {
+      windows: { getLastFocused: vi.fn().mockResolvedValue(window) },
+      idle: { queryState: vi.fn().mockResolvedValue(idleState) },
+    },
+  });
+
+  it.each([
+    ["Chrome is not the focused app", { focused: false, state: "normal", tabs: [{ active: true, url: lunchMoney }] }, "active", false],
+    ["the window is minimized", { focused: true, state: "minimized", tabs: [{ active: true, url: lunchMoney }] }, "active", false],
+    ["another tab is shown", { focused: true, state: "normal", tabs: [{ active: false, url: lunchMoney }, { active: true, url: "https://example.com/" }] }, "active", false],
+    ["the user is idle", { focused: true, state: "normal", tabs: [{ active: true, url: lunchMoney }] }, "idle", false],
+    ["the screen is locked", { focused: true, state: "normal", tabs: [{ active: true, url: lunchMoney }] }, "locked", false],
+    ["Lunch Money is in front of an active user", { focused: true, state: "normal", tabs: [{ active: true, url: lunchMoney }] }, "active", true],
+  ])("is %s → %s", async (_label, window, idleState, expected) => {
+    expect(await check(window, idleState)).toBe(expected);
+  });
 });
 
 const senderSource = source.slice(source.indexOf("function isAllowedSender("), source.indexOf("async function handleMessage("));
@@ -660,6 +699,7 @@ describe("Fortuneo SMS code challenge", () => {
       }) } } },
       DEFAULT_SETTINGS: {}, SYNC_RETRY_COOLDOWN_MS: 15 * 60_000,
       localDate: () => "2026-11-07", activeSync: null, syncStartPending: false, startSync,
+      userIsOnLunchMoney: async () => true,
     });
     expect(await run("2026-11-07")).toBe(false);
     expect(startSync).not.toHaveBeenCalled();
