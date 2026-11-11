@@ -24,17 +24,29 @@ root.querySelector(".actions").addEventListener("click", (event) => {
     bar.hidden = true;
     return;
   }
-  if (action) void chrome.runtime.sendMessage({ type: action });
+  if (action) void sendToExtension({ type: action });
 });
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "ui-state") render(message.uiState);
 });
 
-void chrome.runtime.sendMessage({ type: "get-state" }).then((state) => render(state.uiState));
-void chrome.runtime.sendMessage({ type: "lunch-money-ready" });
+void sendToExtension({ type: "get-state" }).then((state) => render(state?.uiState));
+void sendToExtension({ type: "lunch-money-ready" });
 watchLunchMoneyNavigation();
 watchUserPresence();
+
+// Reloading or updating the extension cuts this script off from it while the tab stays
+// open: chrome.runtime disappears and every send would throw. Stay quiet instead; the
+// reloaded page gets a fresh, connected copy.
+function sendToExtension(message) {
+  try {
+    if (!chrome.runtime?.id) return Promise.resolve(undefined);
+    return chrome.runtime.sendMessage(message).catch(() => undefined);
+  } catch {
+    return Promise.resolve(undefined);
+  }
+}
 setInterval(() => renderProgress(), 250);
 
 // At Chrome launch a restored Lunch Money tab can finish loading before macOS reports
@@ -47,7 +59,7 @@ function watchUserPresence() {
     if (document.visibilityState !== "visible" || !document.hasFocus()) return;
     if (Date.now() - lastAskedAt < PRESENCE_THROTTLE_MS) return;
     lastAskedAt = Date.now();
-    void chrome.runtime.sendMessage({ type: "sync-if-due" }).catch(() => {});
+    void sendToExtension({ type: "sync-if-due" });
   };
   addEventListener("focus", ask);
   document.addEventListener("visibilitychange", ask);
@@ -113,7 +125,7 @@ function watchLunchMoneyNavigation() {
     if (currentUrl === previousUrl) return;
     previousUrl = currentUrl;
     const isOverview = isOverviewUrl(currentUrl);
-    if (isOverview && !wasOverview) void chrome.runtime.sendMessage({ type: "sync-if-due" });
+    if (isOverview && !wasOverview) void sendToExtension({ type: "sync-if-due" });
     wasOverview = isOverview;
   };
 
@@ -130,7 +142,7 @@ function watchLunchMoneyNavigation() {
     if (!target) return;
     const destination = new URL(target.href, location.href);
     if (destination.origin === location.origin && isOverviewUrl(destination.href)) {
-      void chrome.runtime.sendMessage({ type: "sync-if-due" });
+      void sendToExtension({ type: "sync-if-due" });
     }
   }, { capture: true });
 }
