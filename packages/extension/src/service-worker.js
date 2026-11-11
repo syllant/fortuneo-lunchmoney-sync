@@ -284,6 +284,7 @@ async function startSync(type, confirmedSnapshot = null, options = {}) {
     const retainedDetails = type === "sync" && uiState?.operation === "preview" && previewIsRecent ? uiState.details ?? uiState.preview ?? null : null;
     if (type === "dry-run") await chrome.storage.session.remove("confirmedPreviewSnapshot");
     activeSync = { requestId, port, dryRun: type === "dry-run", confirmedSnapshot, snapshot: null, snapshots: [], waitingForFortuneo: false, waitingForAuthentication: false, autoAuthAttempted: afterChallenge, challengeSeen: afterChallenge, authIssue: null, collecting: false, loginProbeId: null, payloads: [], observedPages: new Set(), resourceCandidates: 0, fortuneoDiagnostics: null, retainedDetails, startedAt, timeoutStartedAt: startedAt, deadlineAt: startedAt + SYNC_IDLE_TIMEOUT_MS, waitTimer: null, handshakeTimer: null, authFallbackTimer: null, fortuneoTabId: null, fortuneoTabCreated: false, requestedFortuneoUrl: accountTargets[0] ?? requestedFortuneoUrl, requestedFortuneoTabId, accountTargets, accountTargetIndex: 0, dedicatedFortuneoTab: !(afterChallenge && requestedFortuneoTabId !== null) && (accountTargets.length > 1 || (accountTargets.length === 1 && requestedFortuneoTabId === null)), targetNavigationAttempted: false, progressStep: "setup", fortuneoReadStep: null, authTrace: [], nativeMessageQueue: Promise.resolve() };
+    if (options.closeTabWhenDone === true && requestedFortuneoTabId === options.fortuneoTabId) activeSync.fortuneoTabCreated = true;
     startedSync = activeSync;
     traceAuth(activeSync, "sync-start", { operation: type });
     startupStage = "publishing-start-state";
@@ -1564,7 +1565,9 @@ async function handleFortuneoChallenge(sync, tab, kind) {
   // Signing in again after a code would make Fortuneo send another one.
   sync.autoAuthAttempted = true;
   sync.idleTimeoutMs = FORTUNEO_CHALLENGE_TIMEOUT_MS;
-  // The user needs this tab to type the code, also after the sync gives up.
+  // The user needs this tab to type the code, also after the sync gives up;
+  // remember whether the sync opened it so it can be closed once the code is accepted.
+  sync.challengeTabCreated = Boolean(sync.challengeTabCreated || sync.fortuneoTabCreated);
   sync.fortuneoTabCreated = false;
   clearAuthFallback(sync);
   traceAuth(sync, "security-challenge", { kind });
@@ -1572,7 +1575,7 @@ async function handleFortuneoChallenge(sync, tab, kind) {
   refreshSyncTimeout(sync);
   // Bring the code tab to the front instead of a notification: the user can type the code right away.
   if (tab.id !== undefined) {
-    await chrome.storage.session.set({ fortuneoChallengeTabId: tab.id });
+    await chrome.storage.session.set({ fortuneoChallengeTabId: tab.id, fortuneoChallengeTabCreated: sync.challengeTabCreated });
     await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
     if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   }
@@ -1611,6 +1614,8 @@ async function resolveFortuneoChallenge(sync) {
   sync.challenge = null;
   sync.idleTimeoutMs = null;
   refreshSyncTimeout(sync);
+  // The code was accepted: a tab the sync opened is closed again when the sync ends.
+  sync.fortuneoTabCreated = Boolean(sync.challengeTabCreated);
   // Keep automatic syncs paused for the day (only a success lifts it); the code itself is no longer awaited.
   await chrome.storage.local.set({ fortuneoChallengeKind: null });
   await forgetFortuneoChallengeTab();
@@ -1620,14 +1625,17 @@ async function resumeAfterFortuneoChallenge(tabId) {
   // The code was entered after the sync gave up: finish today's sync with the now-open session.
   const { fortuneoChallengeLocalDate, fortuneoChallengeKind, lastSuccessfulLocalDate, setupPreviewConfirmed } = await chrome.storage.local.get(DEFAULT_SETTINGS);
   if (activeSync || syncStartPending || !setupPreviewConfirmed || !fortuneoChallengeKind || fortuneoChallengeLocalDate !== localDate() || lastSuccessfulLocalDate === localDate()) return false;
+  const { fortuneoChallengeTabId, fortuneoChallengeTabCreated } = await chrome.storage.session.get(["fortuneoChallengeTabId", "fortuneoChallengeTabCreated"]);
   await chrome.storage.local.set({ fortuneoChallengeKind: null });
   await forgetFortuneoChallengeTab();
-  return startSync("sync-if-due", null, { fortuneoTabId: tabId, afterChallenge: true });
+  // Close the code tab after this sync only when an earlier sync opened it.
+  const closeTabWhenDone = fortuneoChallengeTabCreated === true && fortuneoChallengeTabId === tabId;
+  return startSync("sync-if-due", null, { fortuneoTabId: tabId, afterChallenge: true, closeTabWhenDone });
 }
 
 async function forgetFortuneoChallengeTab() {
   try {
-    await chrome.storage.session.remove("fortuneoChallengeTabId");
+    await chrome.storage.session.remove(["fortuneoChallengeTabId", "fortuneoChallengeTabCreated"]);
   } catch {
     // Nothing to clear.
   }

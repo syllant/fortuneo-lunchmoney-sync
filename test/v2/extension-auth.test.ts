@@ -733,6 +733,27 @@ describe("Fortuneo SMS code challenge", () => {
     expect(context.refreshSyncTimeout).toHaveBeenCalledWith(sync);
   });
 
+  it("closes the code tab it opened once the code is accepted, but keeps the user's own tab", async () => {
+    const run = async (fortuneoTabCreated: boolean) => {
+      const sync: Record<string, unknown> = { waitingForFortuneo: false, waitingForAuthentication: false, fortuneoTabCreated, challenge: null, idleTimeoutMs: null };
+      const sessionSet = vi.fn();
+      const context = {
+        sync, activeSync: sync, FORTUNEO_CHALLENGE_KINDS: ["sms-code"], FORTUNEO_CHALLENGE_TIMEOUT_MS: 300_000, localDate: () => "2026-11-07",
+        clearAuthFallback: vi.fn(), traceAuth: vi.fn(), refreshSyncTimeout: vi.fn(), setUi: vi.fn(), authenticationStatusMessage: () => "code",
+        setInterval: vi.fn(() => 1), clearInterval: vi.fn(), inspectFortuneoAuthentication: vi.fn(),
+        chrome: { storage: { local: { set: vi.fn() }, session: { set: sessionSet, remove: vi.fn() } }, tabs: { update: vi.fn().mockResolvedValue({}) }, windows: { update: vi.fn().mockResolvedValue({}) } },
+      };
+      await runInNewContext(`${challengeSource}\nhandleFortuneoChallenge(sync, { id: 7, windowId: 1 }, "sms-code")`, context);
+      // Kept open while the code is awaited, even if the sync gives up.
+      expect(sync.fortuneoTabCreated).toBe(false);
+      expect(sessionSet).toHaveBeenCalledWith({ fortuneoChallengeTabId: 7, fortuneoChallengeTabCreated: fortuneoTabCreated });
+      await runInNewContext(`resolveFortuneoChallenge(sync)`, context);
+      return sync.fortuneoTabCreated;
+    };
+    expect(await run(true)).toBe(true);
+    expect(await run(false)).toBe(false);
+  });
+
   it("reports the SMS prompt from the post-sign-in check instead of waiting for the fallback", async () => {
     const callbacks: Array<() => Promise<void>> = [];
     const sync = { accountTargetIndex: 0, autoAuthAttempted: false, waitingForFortuneo: true, waitingForAuthentication: false };
@@ -789,13 +810,18 @@ describe("Fortuneo SMS code challenge", () => {
   it("resumes in the tab where the code was entered, without signing in again", async () => {
     const startSync = vi.fn().mockResolvedValue(true);
     const localSet = vi.fn();
-    const run = (stored: Record<string, unknown>) => runInNewContext(`${challengeSource}\nresumeAfterFortuneoChallenge(42)`, {
+    const run = (stored: Record<string, unknown>, session: Record<string, unknown> = {}) => runInNewContext(`${challengeSource}\nresumeAfterFortuneoChallenge(42)`, {
       activeSync: null, syncStartPending: false, startSync, DEFAULT_SETTINGS: {}, localDate: () => "2026-11-07",
-      chrome: { storage: { local: { get: vi.fn().mockResolvedValue({ setupPreviewConfirmed: true, lastSuccessfulLocalDate: null, ...stored }), set: localSet }, session: { remove: vi.fn() } } },
+      chrome: { storage: { local: { get: vi.fn().mockResolvedValue({ setupPreviewConfirmed: true, lastSuccessfulLocalDate: null, ...stored }), set: localSet }, session: { get: vi.fn().mockResolvedValue(session), remove: vi.fn() } } },
     });
     expect(await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: null })).toBe(false);
     await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: "sms-code" });
-    expect(startSync).toHaveBeenCalledWith("sync-if-due", null, { fortuneoTabId: 42, afterChallenge: true });
+    expect(startSync).toHaveBeenLastCalledWith("sync-if-due", null, { fortuneoTabId: 42, afterChallenge: true, closeTabWhenDone: false });
+    // A code tab the earlier sync opened is closed once this sync ends; the user's own tab is kept.
+    await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: "sms-code" }, { fortuneoChallengeTabId: 42, fortuneoChallengeTabCreated: true });
+    expect(startSync).toHaveBeenLastCalledWith("sync-if-due", null, { fortuneoTabId: 42, afterChallenge: true, closeTabWhenDone: true });
+    await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: "sms-code" }, { fortuneoChallengeTabId: 42, fortuneoChallengeTabCreated: false });
+    expect(startSync).toHaveBeenLastCalledWith("sync-if-due", null, { fortuneoTabId: 42, afterChallenge: true, closeTabWhenDone: false });
     // The daily pause stays until a sync succeeds.
     expect(localSet).toHaveBeenCalledWith({ fortuneoChallengeKind: null });
   });

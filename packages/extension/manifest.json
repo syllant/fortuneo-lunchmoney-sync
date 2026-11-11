@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Fortuneo → Lunch Money",
-  "version": "2.1.71",
+  "version": "2.1.72",
   "description": "Runs a local Fortuneo sync once a day as soon as you are at Chrome.",
   "minimum_chrome_version": "120",
   "permissions": ["storage", "nativeMessaging", "tabs", "scripting", "alarms", "idle"],
