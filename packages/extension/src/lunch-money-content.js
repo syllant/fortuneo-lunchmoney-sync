@@ -34,7 +34,26 @@ chrome.runtime.onMessage.addListener((message) => {
 void chrome.runtime.sendMessage({ type: "get-state" }).then((state) => render(state.uiState));
 void chrome.runtime.sendMessage({ type: "lunch-money-ready" });
 watchLunchMoneyNavigation();
+watchUserPresence();
 setInterval(() => renderProgress(), 250);
+
+// At Chrome launch a restored Lunch Money tab can finish loading before macOS reports
+// Chrome as focused, so the load-time check is skipped. Ask again once the user is
+// visibly here; the service worker ignores these when the day is already synced.
+function watchUserPresence() {
+  const PRESENCE_THROTTLE_MS = 30_000;
+  let lastAskedAt = 0;
+  const ask = () => {
+    if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+    if (Date.now() - lastAskedAt < PRESENCE_THROTTLE_MS) return;
+    lastAskedAt = Date.now();
+    void chrome.runtime.sendMessage({ type: "sync-if-due" }).catch(() => {});
+  };
+  addEventListener("focus", ask);
+  document.addEventListener("visibilitychange", ask);
+  for (const type of ["pointerdown", "keydown", "wheel"]) addEventListener(type, ask, { capture: true, passive: true });
+  setTimeout(ask, 5_000);
+}
 
 let renderedState;
 let dismissedUpdatedAt = null;
