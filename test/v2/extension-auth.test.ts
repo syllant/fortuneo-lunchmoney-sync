@@ -707,30 +707,29 @@ describe("Fortuneo SMS code challenge", () => {
     expect(startSync).toHaveBeenCalledOnce();
   });
 
-  it("keeps the code tab, extends the wait, shows a notification and records the pause", async () => {
+  it("keeps the code tab, brings it to the front, extends the wait and records the pause", async () => {
     const sync = { waitingForFortuneo: false, waitingForAuthentication: false, fortuneoTabCreated: true, challenge: null as string | null, idleTimeoutMs: null as number | null };
     const localSet = vi.fn();
-    const create = vi.fn();
     const context = {
       sync, activeSync: sync, FORTUNEO_CHALLENGE_KINDS: ["sms-code", "security-challenge"], FORTUNEO_CHALLENGE_TIMEOUT_MS: 300_000,
-      FORTUNEO_CHALLENGE_NOTIFICATION: "challenge", localDate: () => "2026-11-07",
+      localDate: () => "2026-11-07",
       clearAuthFallback: vi.fn(), traceAuth: vi.fn(), refreshSyncTimeout: vi.fn(), setUi: vi.fn(),
       authenticationStatusMessage: () => "Enter the code Fortuneo sent by SMS; sync will resume automatically.",
-      OffscreenCanvas: undefined, setInterval: vi.fn(() => 9), clearInterval: vi.fn(), inspectFortuneoAuthentication: vi.fn(),
+      setInterval: vi.fn(() => 9), clearInterval: vi.fn(), inspectFortuneoAuthentication: vi.fn(),
       chrome: {
         storage: { local: { set: localSet }, session: { set: vi.fn() } },
         tabs: { update: vi.fn().mockResolvedValue({}) },
-        notifications: { clear: vi.fn(), create },
+        windows: { update: vi.fn().mockResolvedValue({}) },
       },
     };
-    await runInNewContext(`${challengeSource}\nhandleFortuneoChallenge(sync, { id: 7 }, "sms-code")`, context);
-    await runInNewContext(`handleFortuneoChallenge(sync, { id: 7 }, "sms-code")`, context);
+    await runInNewContext(`${challengeSource}\nhandleFortuneoChallenge(sync, { id: 7, windowId: 3 }, "sms-code")`, context);
+    await runInNewContext(`handleFortuneoChallenge(sync, { id: 7, windowId: 3 }, "sms-code")`, context);
     expect(sync).toMatchObject({ challenge: "sms-code", challengeSeen: true, challengeCount: 1, autoAuthAttempted: true, idleTimeoutMs: 300_000, fortuneoTabCreated: false, waitingForAuthentication: true });
     expect(localSet).toHaveBeenCalledOnce();
     expect(localSet).toHaveBeenCalledWith({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: "sms-code" });
     expect(context.chrome.tabs.update).toHaveBeenCalledWith(7, { active: true });
+    expect(context.chrome.windows.update).toHaveBeenCalledWith(3, { focused: true });
     expect(context.setUi).toHaveBeenCalledWith("needs-auth", "Enter the code Fortuneo sent by SMS; sync will resume automatically.", []);
-    // The icon cannot be drawn in this test context; the notification is best-effort.
     expect(context.refreshSyncTimeout).toHaveBeenCalledWith(sync);
   });
 
@@ -792,7 +791,6 @@ describe("Fortuneo SMS code challenge", () => {
     const localSet = vi.fn();
     const run = (stored: Record<string, unknown>) => runInNewContext(`${challengeSource}\nresumeAfterFortuneoChallenge(42)`, {
       activeSync: null, syncStartPending: false, startSync, DEFAULT_SETTINGS: {}, localDate: () => "2026-11-07",
-      FORTUNEO_CHALLENGE_NOTIFICATION: "challenge",
       chrome: { storage: { local: { get: vi.fn().mockResolvedValue({ setupPreviewConfirmed: true, lastSuccessfulLocalDate: null, ...stored }), set: localSet }, session: { remove: vi.fn() } } },
     });
     expect(await run({ fortuneoChallengeLocalDate: "2026-11-07", fortuneoChallengeKind: null })).toBe(false);
@@ -874,7 +872,7 @@ describe("Fortuneo SMS code challenge", () => {
     const sync: Record<string, unknown> = { waitingForFortuneo: true, waitingForAuthentication: true, fortuneoTabCreated: false, challenge: null, autoAuthAttempted: true };
     const context = {
       sync, activeSync: sync, FORTUNEO_CHALLENGE_KINDS: ["sms-code"], FORTUNEO_CHALLENGE_TIMEOUT_MS: 300_000,
-      FORTUNEO_CHALLENGE_NOTIFICATION: "challenge", localDate: () => "2026-11-07",
+      localDate: () => "2026-11-07",
       clearAuthFallback: vi.fn(), traceAuth: vi.fn(), refreshSyncTimeout: vi.fn(), setUi: vi.fn(), authenticationStatusMessage: () => "code",
       setInterval: vi.fn(() => 1), clearInterval: vi.fn(), inspectFortuneoAuthentication: vi.fn(),
       chrome: { storage: { local: { set: vi.fn() }, session: { set: vi.fn() } }, tabs: { update: vi.fn().mockResolvedValue({}) } },

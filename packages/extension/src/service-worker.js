@@ -12,7 +12,6 @@ const SYNC_IDLE_TIMEOUT_MS = 60_000;
 const SYNC_RETRY_COOLDOWN_MS = 15 * 60_000;
 // Leave time to receive and type a Fortuneo SMS code before abandoning the sync.
 const FORTUNEO_CHALLENGE_TIMEOUT_MS = 5 * 60_000;
-const FORTUNEO_CHALLENGE_NOTIFICATION = "fortuneo-security-challenge";
 const FORTUNEO_CHALLENGE_KINDS = ["sms-code", "security-challenge"];
 const POST_CHALLENGE_SETTLE_MS = 4_000;
 const MAX_READ_INTERRUPTIONS = 2;
@@ -61,10 +60,6 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 });
 chrome.idle?.onStateChanged.addListener((state) => {
   if (state === "active") void initialized.then(() => syncIfDue());
-});
-
-chrome.notifications?.onClicked.addListener((notificationId) => {
-  if (notificationId === FORTUNEO_CHALLENGE_NOTIFICATION) void showFortuneoChallengeTab();
 });
 
 async function syncForLunchMoneyTab(tabId) {
@@ -443,7 +438,7 @@ async function handleNativeMessage(message) {
     else if (!message.dryRun || !message.ok) await chrome.storage.session.remove("confirmedPreviewSnapshot");
     if (Boolean(details) && !message.dryRun) {
       await chrome.storage.local.set({ ...(reviewNotification.keys ? { reportedCardReviewKeys: reviewNotification.keys } : {}), lastSuccessfulLocalDate: localDate(), lastSuccessfulAt: new Date().toISOString(), setupPreviewConfirmed: true, fortuneoChallengeLocalDate: null, fortuneoChallengeKind: null });
-      await clearFortuneoChallengeNotification();
+      await forgetFortuneoChallengeTab();
     }
     await setUi(status, resultMessage, warnings, details, message.dryRun ? "preview" : "sync", completed.authTrace);
     const port = completed.port;
@@ -1575,15 +1570,16 @@ async function handleFortuneoChallenge(sync, tab, kind) {
   traceAuth(sync, "security-challenge", { kind });
   await chrome.storage.local.set({ fortuneoChallengeLocalDate: localDate(), fortuneoChallengeKind: kind });
   refreshSyncTimeout(sync);
+  // Bring the code tab to the front instead of a notification: the user can type the code right away.
   if (tab.id !== undefined) {
     await chrome.storage.session.set({ fortuneoChallengeTabId: tab.id });
     await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   }
   if (activeSync !== sync) return;
   const message = authenticationStatusMessage({ error: kind });
   sync.authenticationMessage = message;
   await setUi("needs-auth", message, []);
-  await showFortuneoChallengeNotification(kind);
   if (tab.id !== undefined) watchFortuneoChallenge(sync, tab.id);
 }
 
@@ -1617,7 +1613,7 @@ async function resolveFortuneoChallenge(sync) {
   refreshSyncTimeout(sync);
   // Keep automatic syncs paused for the day (only a success lifts it); the code itself is no longer awaited.
   await chrome.storage.local.set({ fortuneoChallengeKind: null });
-  await clearFortuneoChallengeNotification();
+  await forgetFortuneoChallengeTab();
 }
 
 async function resumeAfterFortuneoChallenge(tabId) {
@@ -1625,63 +1621,15 @@ async function resumeAfterFortuneoChallenge(tabId) {
   const { fortuneoChallengeLocalDate, fortuneoChallengeKind, lastSuccessfulLocalDate, setupPreviewConfirmed } = await chrome.storage.local.get(DEFAULT_SETTINGS);
   if (activeSync || syncStartPending || !setupPreviewConfirmed || !fortuneoChallengeKind || fortuneoChallengeLocalDate !== localDate() || lastSuccessfulLocalDate === localDate()) return false;
   await chrome.storage.local.set({ fortuneoChallengeKind: null });
-  await clearFortuneoChallengeNotification();
+  await forgetFortuneoChallengeTab();
   return startSync("sync-if-due", null, { fortuneoTabId: tabId, afterChallenge: true });
 }
 
-async function showFortuneoChallengeNotification(kind) {
-  if (!chrome.notifications) return;
+async function forgetFortuneoChallengeTab() {
   try {
-    await chrome.notifications.clear(FORTUNEO_CHALLENGE_NOTIFICATION);
-    await chrome.notifications.create(FORTUNEO_CHALLENGE_NOTIFICATION, {
-      type: "basic",
-      iconUrl: await challengeNotificationIcon(kind),
-      title: kind === "sms-code" ? "Fortuneo sent you an SMS code" : "Fortuneo needs a security check",
-      message: kind === "sms-code"
-        ? "Enter the code in the Fortuneo tab to finish today's Lunch Money sync."
-        : "Complete the check in the Fortuneo tab to finish today's Lunch Money sync.",
-      priority: 2,
-      requireInteraction: true,
-    });
-  } catch {
-    // The toolbar badge still reports the pending code.
-  }
-}
-
-async function clearFortuneoChallengeNotification() {
-  try {
-    await chrome.notifications?.clear(FORTUNEO_CHALLENGE_NOTIFICATION);
     await chrome.storage.session.remove("fortuneoChallengeTabId");
   } catch {
     // Nothing to clear.
   }
 }
 
-async function showFortuneoChallengeTab() {
-  const { fortuneoChallengeTabId } = await chrome.storage.session.get("fortuneoChallengeTabId");
-  const tab = Number.isSafeInteger(fortuneoChallengeTabId) ? await chrome.tabs.get(fortuneoChallengeTabId).catch(() => null) : null;
-  if (tab?.id !== undefined && tab.url?.startsWith("https://mabanque.fortuneo.fr/")) {
-    await chrome.tabs.update(tab.id, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
-  } else {
-    await chrome.tabs.create({ url: FORTUNEO_LOGIN, active: true });
-  }
-}
-
-async function challengeNotificationIcon(kind) {
-  const canvas = new OffscreenCanvas(128, 128);
-  const context = canvas.getContext("2d");
-  context.fillStyle = "#7a3fb0";
-  context.beginPath();
-  context.roundRect(0, 0, 128, 128, 28);
-  context.fill();
-  context.fillStyle = "#ffffff";
-  context.font = "bold 44px sans-serif";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText(kind === "sms-code" ? "SMS" : "2FA", 64, 68);
-  const bytes = new Uint8Array(await (await canvas.convertToBlob({ type: "image/png" })).arrayBuffer());
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return `data:image/png;base64,${btoa(binary)}`;
-}
